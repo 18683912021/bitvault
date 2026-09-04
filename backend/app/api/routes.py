@@ -308,35 +308,6 @@ async def brain_update_config(request: Request, body: dict):
     return {"ok": True, "config": new_cfg, "venue": s.venue}
 
 
-@router.post("/brain/decide")
-async def brain_decide(request: Request, body: dict):
-    """手动触发一次 LLM 决策（不下单，只返回建议）。"""
-    s = svc(request)
-    if not s.brain:
-        raise HTTPException(400, "决策大脑未就绪")
-    from app.brain.llm_client import LLMClient
-    from app.brain.decision_brain import DecisionBrain
-    inst_id = body.get("inst_id", "BTC-USDT")
-    period = body.get("period", "5m")
-    candles = db.query(
-        "SELECT open_time as ts, o, h, l, c, vol FROM bars WHERE inst_id=? AND period=? ORDER BY open_time ASC LIMIT 100",
-        (inst_id, period),
-    )
-    if len(candles) < 10:
-        raise HTTPException(400, "K 线数据不足，请先等待行情采集")
-    acct = s.paper.summary() if s.paper else {"equity": 0, "usdt": 0}
-    position = None
-    if s.paper:
-        positions = acct.get("positions", [])
-        for p in positions:
-            if p.get("inst_id") == inst_id and p.get("sz", 0) > 0:
-                position = {"side": "buy", "sz": p["sz"], "entry_px": 0, "last": p.get("last", 0)}
-    # 临时 brain 实例（不影响 autopilot 状态）
-    tmp_brain = DecisionBrain(s.llm or LLMClient())
-    decision = await tmp_brain.analyze(inst_id, candles, position, acct)
-    return decision
-
-
 @router.get("/brain/history")
 async def brain_history(request: Request, limit: int = 20):
     s = svc(request)

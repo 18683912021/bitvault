@@ -4,7 +4,7 @@ import type {
   AccountSummary, AccountConfig, Position, Order, TradeRecord,
   StrategyTemplate, StrategyInstance, BacktestListItem, BacktestDetail,
   RiskStatus, RiskEvent, Notification, AuditLog, RiskRuleEntry,
-  Mode, PaperAccount, BrainStatus, BrainDecision, BrainHistory,
+  Mode, PaperAccount, BrainStatus, BrainHistory,
   RoundTripSummary, Forecast10,
 } from './types';
 
@@ -101,8 +101,6 @@ export const startAutopilot = (overrides?: { period?: string; min_confidence?: n
 export const stopAutopilot = () => api.post<{ ok: boolean; config: any }>('/brain/autopilot/stop');
 export const updateBrainConfig = (body: Record<string, any>) =>
   api.post<{ ok: boolean; config: any }>('/brain/config', body);
-export const decideNow = (inst_id = 'BTC-USDT', period = '5m') =>
-  api.post<BrainDecision>('/brain/decide', { inst_id, period });
 export const getBrainHistory = (limit = 20) =>
   api.get<BrainHistory[]>('/brain/history', { limit });
 

@@ -14,8 +14,6 @@ from app import config, db
 from app.account.account_service import AccountService
 from app.api import routes, ws as ws_routes
 from app.brain.autopilot import Autopilot
-from app.brain.decision_brain import DecisionBrain
-from app.brain.llm_client import LLMClient, ensure_seed as llm_seed
 from app.core import event_bus, security
 from app.exchange.okx_client import OkxClient
 from app.exchange.okx_ws import OkxWebSocket
@@ -44,7 +42,6 @@ class Services:
         self.business_ws: OkxWebSocket | None = None
         self.risk = RiskEngine()
         self.paper: PaperEngine | None = None
-        self.llm: LLMClient | None = None
         self.brain: Autopilot | None = None
         self.manager: StrategyManager | None = None
         # 系统级模式（venue）：'paper' 模拟虚拟资金 / 'okx' 实盘真实资金。
@@ -107,11 +104,8 @@ class Services:
         # 本地模拟盘：无 Key 常驻可用（paper 模式）
         self.paper = PaperEngine(self.data, self.risk)
         await self.paper.start()
-        # 决策大脑 + Autopilot
-        llm_seed()  # 写入加密 LLM Key（如 settings 无）
-        self.llm = LLMClient()
-        decision_brain = DecisionBrain(self.llm)
-        self.brain = Autopilot(self.data, self.paper, decision_brain, self.risk)
+        # Autopilot（纯规则自动驾驶）
+        self.brain = Autopilot(self.data, self.paper, self.risk)
         self.brain.bind_svc(self)   # 注入容器：autopilot 据此读取系统级 venue + 实盘 oms/account
         await self.brain.start()
         self.manager = StrategyManager(oms=None, risk=self.risk, account=None, data=self.data,
@@ -147,11 +141,18 @@ class Services:
     async def _forecast_loop(self) -> None:
         from app.brain import forecast10
 
+        n = 0
         while True:
+            t0 = asyncio.get_event_loop().time()
             try:
                 result = forecast10.compute(self.data, "BTC-USDT")
                 if result.get("direction") != "unknown" or result.get("ref_price"):
                     event_bus.publish("forecast", result)
+                    n += 1
+                if n % 6 == 0:
+                    cost = (asyncio.get_event_loop().time() - t0) * 1000
+                    log.info("forecast #%d cost=%.1fms p_up=%s px=%s", n, cost,
+                             result.get("p_up"), result.get("ref_price"))
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -263,8 +264,6 @@ async def _lifespan(app: FastAPI):
         await svc.paper.stop()
     if svc.brain:
         await svc.brain.stop()
-    if svc.llm:
-        await svc.llm.aclose()
     if svc.manager:
         await svc.manager.stop()
     if svc._time_task:

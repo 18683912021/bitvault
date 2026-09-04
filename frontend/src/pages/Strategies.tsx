@@ -13,7 +13,7 @@ import { useStrategyStore } from '../store/useStrategyStore';
 import {
   getTemplates, getInstances, createInstance, startInstance, stopInstance,
   pauseInstance, resumeInstance, deleteInstance,
-  getBrainStatus, startAutopilot, stopAutopilot, decideNow, getBrainHistory,
+  getBrainStatus, startAutopilot, stopAutopilot, getBrainHistory,
 } from '../api/endpoints';
 import { PERIODS, fmtUsd, fmtTime, fmtTimeShort } from '../utils/format';
 import type { StrategyTemplate, StrategyInstance, InstanceStatus } from '../api/types';
@@ -267,7 +267,6 @@ function startIt(r: StrategyInstance) {
 function AutopilotCard() {
   const [status, setStatus] = useState<any>(null);
   const [history, setHistory] = useState<any[]>([]);
-  const [deciding, setDeciding] = useState(false);
   const [period, setPeriod] = useState<'5m' | '15m' | '1H' | '4H'>('1H');
   const [minConf, setMinConf] = useState(0.4);
 
@@ -293,11 +292,6 @@ function AutopilotCard() {
       await stopAutopilot();
     }
     load();
-  };
-
-  const decide = async () => {
-    setDeciding(true);
-    try { await decideNow('BTC-USDT', period); } finally { setDeciding(false); load(); }
   };
 
   const last = status?.last_decision;
@@ -341,9 +335,6 @@ function AutopilotCard() {
         <Col span={4}><Statistic title="置信度" value={last?.confidence ?? 0} precision={2} valueStyle={{ fontSize: 16 }} /></Col>
         <Col span={4}>
           <Statistic title="当前持仓" value={pos ? `${pos.side === 'buy' ? '多' : '空'} ${pos.sz?.toFixed(5)}` : '空仓'} valueStyle={{ fontSize: 16 }} />
-        </Col>
-        <Col span={4}>
-          <Button size="small" type="dashed" loading={deciding} onClick={decide} block>立即决策</Button>
         </Col>
       </Row>
       {thLine.length > 0 && (

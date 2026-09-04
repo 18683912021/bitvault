@@ -12,11 +12,15 @@ FRONTEND_DIST = os.path.join(os.path.dirname(BASE_DIR), "frontend", "dist")
 HOST = os.environ.get("BV_HOST", "127.0.0.1")
 PORT = int(os.environ.get("BV_PORT", "8000"))
 
-OKX_REST_BASE = "https://www.okx.com"
-OKX_WS_PUBLIC = "wss://ws.okx.com:8443/ws/v5/public"
-OKX_WS_BUSINESS = "wss://ws.okx.com:8443/ws/v5/business"
-OKX_WS_PRIVATE = "wss://ws.okx.com:8443/ws/v5/private"
-OKX_WS_PRIVATE_DEMO = "wss://wspap.okx.com:8443/ws/v5/private"
+# OKX 接入点：默认主站；大陆服务器连不上 www.okx.com 时，通过环境变量切换
+# 官方 AWS 接入点（deploy/env.example 有现成模板），无需改代码。
+OKX_REST_BASE = os.environ.get("BV_OKX_REST_BASE", "https://www.okx.com")
+OKX_WS_PUBLIC = os.environ.get("BV_OKX_WS_PUBLIC", "wss://ws.okx.com:8443/ws/v5/public")
+OKX_WS_BUSINESS = os.environ.get("BV_OKX_WS_BUSINESS", "wss://ws.okx.com:8443/ws/v5/business")
+OKX_WS_PRIVATE = os.environ.get("BV_OKX_WS_PRIVATE", "wss://ws.okx.com:8443/ws/v5/private")
+OKX_WS_PRIVATE_DEMO = os.environ.get(
+    "BV_OKX_WS_PRIVATE_DEMO", "wss://wspap.okx.com:8443/ws/v5/private"
+)
 
 # 交易标的白名单（红线 R3：白名单之外一律拒单）
 INSTRUMENT_WHITELIST = ["BTC-USDT", "BTC-USDT-SWAP"]

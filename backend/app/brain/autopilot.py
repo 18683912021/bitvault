@@ -44,10 +44,9 @@ TIME_STOP_BARS = 120         # 时间止损：120 根 bar 未到 TP1 且浮亏 �
 
 
 class Autopilot:
-    def __init__(self, data, paper, brain=None, risk=None):
+    def __init__(self, data, paper, risk=None):
         self.data = data
         self.paper = paper
-        self.brain = brain          # 保留引用（手动分析端点用），决策链不再依赖
         self.risk = risk
         self.svc = None            # Services 容器引用（bind_svc 注入）：用于读取 venue/oms/account
         self._task: asyncio.Task | None = None

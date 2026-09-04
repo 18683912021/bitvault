@@ -72,6 +72,9 @@ def compute(data: Any, inst_id: str = "BTC-USDT") -> dict:
     closes = [b["c"] for b in bars_1m]
     ref_price = data.last_price(inst_id) or closes[-1]
     base["ref_price"] = round(ref_price, 2)
+    # 实时价并入动量/均线因子：每次 10 秒计算都反映最新价（全部为已发生数据，无未来函数）。
+    # RSI/布林/量能仍用已收盘 K 线，保持稳定不被盘中抖动污染。
+    closes_l = closes + [ref_price]
 
     # 市场状态门控（复用因子引擎的七态识别，只看已收盘 K 线，无未来函数）
     regime_info = classify_regime(bars_1m)
@@ -94,14 +97,14 @@ def compute(data: Any, inst_id: str = "BTC-USDT") -> dict:
             "contrib": round(score * weight, 3),
         })
 
-    # 1. 短期动量（近 5 根收盘 1m 收益惯性）
-    if len(closes) >= 6:
-        ret5 = (closes[-1] - closes[-6]) / closes[-6]
+    # 1. 短期动量（含实时价的近 5 分钟收益惯性）
+    if len(closes_l) >= 6:
+        ret5 = (closes_l[-1] - closes_l[-6]) / closes_l[-6]
         add("mom_5m", "5分钟动量", f"{ret5 * 100:+.3f}%",
             _tanh_scale(ret5, 0.0025), 0.26)
 
-    # 2. 1m EMA 排列强度
-    ema_f, ema_s = _ema(closes, 9), _ema(closes, 21)
+    # 2. 1m EMA 排列强度（含实时价）
+    ema_f, ema_s = _ema(closes_l, 9), _ema(closes_l, 21)
     if ema_s > 0:
         add("ema_1m", "1m均线排列", f"EMA9 {ema_f:.1f} vs EMA21 {ema_s:.1f}",
             _tanh_scale((ema_f - ema_s) / ema_s, 0.0012), 0.16)
@@ -128,11 +131,11 @@ def compute(data: Any, inst_id: str = "BTC-USDT") -> dict:
     _, _, _, bb_pos = _bollinger(closes, 20)
     add("bb_rev", "布林带位置", f"{bb_pos * 100:.0f}%位", (0.5 - bb_pos) * 2, 0.07)
 
-    # 7. 量能确认（放量方向跟随）
+    # 7. 量能确认（放量方向跟随，方向含实时价）
     vols = [b.get("vol", 0) for b in bars_1m]
     if len(vols) >= 21 and sum(vols[-21:-1]) > 0:
         vol_ratio = vols[-1] / (sum(vols[-21:-1]) / 20)
-        ret5_sign = 1 if closes[-1] >= closes[-6] else -1
+        ret5_sign = 1 if closes_l[-1] >= closes_l[-6] else -1
         add("vol_conf", "量能确认", f"量比 {vol_ratio:.1f}x",
             ret5_sign * _clamp((vol_ratio - 1) / 2, -1, 1), 0.06)
 
