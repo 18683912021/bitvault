@@ -24,10 +24,28 @@ export interface BrainStatus {
   enabled: boolean;
   running: boolean;
   period: string;
+  engine?: string;
+  venue: 'paper' | 'okx';
+  live_ready?: boolean;
   last_action: string;
   last_decision: BrainDecision | null;
   last_error: string;
   position: any;
+  regime?: string;
+  regime_reason?: string;
+  throttle?: {
+    sleeping: boolean;
+    sleep_until: number;
+    cooldown_until: number;
+    opens_today: number;
+    max_opens_per_day: number;
+    loss_streak: number;
+    cooldown_min: number;
+    loss_pause_n: number;
+    loss_pause_min: number;
+  };
+  mode?: 'normal' | 'sprint';
+  leverage?: number;
 }
 
 export interface BrainDecision {
@@ -189,6 +207,7 @@ export interface TradeRecord {
   fee: number;
   instance_id?: number | null;
   ts: number;
+  venue?: 'okx' | 'paper';   // 由 /trades 端点 JOIN orders 返回
 }
 
 // 交易闭环（FIFO 开平配对，/api/roundtrips）
@@ -335,6 +354,7 @@ export interface AuditLog {
 export interface SystemStatus {
   env: Env;
   has_key: boolean;
+  venue: 'paper' | 'okx';
   time_offset_ms: number;
   market?: Record<string, string>;
   private_ws: string;
@@ -355,10 +375,36 @@ export interface WsSnapshot {
 
 export type WsTopic =
   | 'snapshot' | 'tick' | 'bar' | 'depth' | 'trade'
-  | 'order' | 'account' | 'log' | 'risk' | 'strategy';
+  | 'order' | 'account' | 'log' | 'risk' | 'strategy' | 'forecast';
 
 export interface WsMessage {
   topic: WsTopic;
   data: any;
   ts?: number;
+}
+
+// 10 分钟涨跌预测（事件合约参考）
+export interface ForecastFactor {
+  key: string;
+  label: string;
+  value_text: string;
+  score: number;
+  weight: number;
+  contrib: number;
+}
+
+export interface Forecast10 {
+  inst_id: string;
+  ts: number;
+  direction: 'up' | 'down' | 'flat' | 'unknown';
+  p_up: number;
+  score: number;
+  conf_scale: number;
+  regime: string;
+  regime_reason: string;
+  window_start_ts: number;
+  window_end_ts: number;
+  ref_price: number;
+  factors: ForecastFactor[];
+  note: string;
 }

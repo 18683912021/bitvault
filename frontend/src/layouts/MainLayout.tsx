@@ -2,12 +2,12 @@ import { useEffect } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { Layout, Menu, Badge, Space, Typography, theme } from 'antd';
 import {
-  DashboardOutlined, LineChartOutlined, WalletOutlined, RobotOutlined,
-  ExperimentOutlined, UnorderedListOutlined, SafetyCertificateOutlined,
-  BellOutlined, SettingOutlined, WifiOutlined, DisconnectOutlined,
+  DashboardOutlined, WalletOutlined,
+  UnorderedListOutlined, SafetyCertificateOutlined,
+  SettingOutlined, BellOutlined, WifiOutlined, DisconnectOutlined,
 } from '@ant-design/icons';
-import EnvBadge from '../components/EnvBadge';
 import KillSwitch from '../components/KillSwitch';
+import HeaderControl from '../components/HeaderControl';
 import { useAppStore } from '../store/useAppStore';
 import { useBitVaultWS } from '../ws/useBitVaultWS';
 import { getStatus, getNotifications } from '../api/endpoints';
@@ -17,13 +17,9 @@ const { Header, Sider, Content } = Layout;
 
 const NAV = [
   { key: '/', label: '总览', icon: <DashboardOutlined /> },
-  { key: '/market', label: '行情中心', icon: <LineChartOutlined /> },
   { key: '/account', label: '账户资产', icon: <WalletOutlined /> },
-  { key: '/strategies', label: '策略中心', icon: <RobotOutlined /> },
-  { key: '/backtest', label: '回测中心', icon: <ExperimentOutlined /> },
   { key: '/orders', label: '订单管理', icon: <UnorderedListOutlined /> },
   { key: '/risk', label: '风控中心', icon: <SafetyCertificateOutlined /> },
-  { key: '/notifications', label: '通知中心', icon: <BellOutlined /> },
   { key: '/settings', label: '系统设置', icon: <SettingOutlined /> },
 ];
 
@@ -31,12 +27,12 @@ export default function MainLayout() {
   const nav = useNavigate();
   const loc = useLocation();
   const { token } = theme.useToken();
-  const env = useAppStore((s) => s.env);
   const wsConnected = useAppStore((s) => s.wsConnected);
   const unread = useAppStore((s) => s.unread);
   const setEnv = useAppStore((s) => s.setEnv);
   const setHasKey = useAppStore((s) => s.setHasKey);
   const setRisk = useAppStore((s) => s.setRisk);
+  const setVenue = useAppStore((s) => s.setVenue);
   const setNotifications = useAppStore((s) => s.setNotifications);
   useBitVaultWS();
 
@@ -48,6 +44,7 @@ export default function MainLayout() {
         setEnv(st.env);
         setHasKey(st.has_key);
         setRisk(st.risk);
+        if (st.venue) setVenue(st.venue);   // 同步后端系统级模式（paper/okx）
       } catch { /* ignore */ }
       try {
         const ns = await getNotifications(50);
@@ -57,10 +54,9 @@ export default function MainLayout() {
     poll();
     const t = setInterval(poll, 10000);
     return () => clearInterval(t);
-  }, [setEnv, setHasKey, setRisk, setNotifications]);
+  }, [setEnv, setHasKey, setRisk, setVenue, setNotifications]);
 
-  // LIVE 环境顶栏红色（红线 §10）
-  const isLive = env === 'live';
+  // 顶部保持中性简洁：自动驾驶跟随系统级模式（顶栏 Switch + 彩色徽章 + 模式切换）
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
@@ -100,24 +96,22 @@ export default function MainLayout() {
       <Layout>
         <Header
           style={{
-            background: isLive ? '#cf1322' : token.colorBgContainer,
+            position: 'sticky',
+            top: 0,
+            zIndex: 100,
+            background: token.colorBgContainer,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            padding: '0 16px',
-            boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+            padding: '0 20px',
+            height: 52,
+            lineHeight: '52px',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.08)',
           }}
         >
           <Space size="middle">
-            {isLive ? (
-              <Typography.Text strong style={{ color: '#fff' }}>
-                ⚠ 实盘环境 LIVE — 操作将影响真实资金
-              </Typography.Text>
-            ) : (
-              <Typography.Text strong>BitVault 控制台</Typography.Text>
-            )}
-            <EnvBadge env={env} />
-            <Typography.Text type={isLive ? undefined : 'secondary'} style={{ color: isLive ? '#fff' : undefined }}>
+            <Typography.Text strong>BitVault</Typography.Text>
+            <Typography.Text type="secondary">
               {wsConnected ? (
                 <><WifiOutlined /> 已连接</>
               ) : (
@@ -126,6 +120,7 @@ export default function MainLayout() {
             </Typography.Text>
           </Space>
           <Space size="middle">
+            <HeaderControl />
             <Badge
               count={unread}
               size="small"
@@ -133,7 +128,7 @@ export default function MainLayout() {
               style={{ display: unread ? 'inline' : 'none' }}
             >
               <BellOutlined
-                style={{ fontSize: 18, color: isLive ? '#fff' : token.colorText }}
+                style={{ fontSize: 18, color: token.colorText }}
                 onClick={() => nav('/notifications')}
               />
             </Badge>
@@ -144,7 +139,7 @@ export default function MainLayout() {
           <Outlet />
         </Content>
         <Layout.Footer style={{ textAlign: 'center', color: '#999', fontSize: 12 }}>
-          BitVault · 本地部署 · 默认 OKX 模拟盘 · {fmtTime(Date.now())}
+          BitVault · BTC 量化交易操作系统 · {fmtTime(Date.now())}
         </Layout.Footer>
       </Layout>
     </Layout>

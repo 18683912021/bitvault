@@ -268,11 +268,15 @@ function AutopilotCard() {
   const [status, setStatus] = useState<any>(null);
   const [history, setHistory] = useState<any[]>([]);
   const [deciding, setDeciding] = useState(false);
-  const [period, setPeriod] = useState<'1m' | '5m'>('5m');
+  const [period, setPeriod] = useState<'5m' | '15m' | '1H' | '4H'>('1H');
   const [minConf, setMinConf] = useState(0.4);
 
   const load = () => {
-    getBrainStatus().then(setStatus).catch(() => {});
+    getBrainStatus().then(s => {
+      setStatus(s);
+      const p = s?.period;
+      if (p === '5m' || p === '15m' || p === '1H' || p === '4H') setPeriod(p);
+    }).catch(() => {});
     getBrainHistory(5).then(setHistory).catch(() => {});
   };
 
@@ -310,12 +314,12 @@ function AutopilotCard() {
   return (
     <Card
       size="small"
-      title={<Space><ThunderboltOutlined /> 自动驾驶（LLM 决策大脑）</Space>}
+      title={<Space><ThunderboltOutlined /> 自动驾驶（纯规则决策）</Space>}
       style={{ marginBottom: 16 }}
       extra={(
         <Space>
           <Select size="small" value={period} onChange={setPeriod} style={{ width: 80 }}
-            options={[{ value: '1m', label: '1m' }, { value: '5m', label: '5m' }]} />
+            options={[{ value: '5m', label: '5m' }, { value: '15m', label: '15m' }, { value: '1H', label: '1H' }, { value: '4H', label: '4H' }]} />
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>阈值</Typography.Text>
           <InputNumber size="small" min={0} max={1} step={0.1} value={minConf} onChange={(v) => setMinConf(v || 0.4)} style={{ width: 70 }} />
           <Switch checked={!!status?.enabled} onChange={toggle}
@@ -326,6 +330,9 @@ function AutopilotCard() {
       <Row gutter={16}>
         <Col span={4}>
           <Statistic title="状态" value={status?.enabled ? '运行' : '停止'} valueStyle={{ fontSize: 16 }} />
+          {status?.venue === 'okx'
+            ? <Tag color="red" style={{ marginTop: 4 }}>实盘{status?.live_ready === false ? '·未就绪' : ''}</Tag>
+            : <Tag color="blue" style={{ marginTop: 4 }}>模拟</Tag>}
           {th?.sleep_until > Date.now() && <Tag color="orange" style={{ marginTop: 4 }}>休眠中</Tag>}
           {!(th?.sleep_until > Date.now()) && th?.cooldown_until > Date.now() && <Tag color="blue" style={{ marginTop: 4 }}>冷却中</Tag>}
         </Col>
@@ -360,8 +367,9 @@ function AutopilotCard() {
         </div>
       )}
       <Typography.Text type="secondary" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
-        DeepSeek 驱动，每根 K 线收盘后调用 LLM 综合因子（RSI/MACD/布林/ATR/趋势/动量）产出结构化决策，
-        自动在本地模拟账户开/平仓，含止损止盈与反向反手。所有决策记录在 signals 表（instance_id=0）。
+        纯规则驱动（无 LLM/AI），每根 K 线收盘后运行因子引擎→Regime 六态→HTF(4H+1D) 确认→
+        形态识别(breakout_retest)→十项守卫→评分≥70→风险预算仓位，跟随顶栏系统级模式在模拟（虚拟资金）
+        或实盘（真实资金）账户开/平仓，含结构止损+分批止盈+trailing。所有决策记录在 signals 表（instance_id=0，含 decide:wait 观望记录）。
       </Typography.Text>
     </Card>
   );

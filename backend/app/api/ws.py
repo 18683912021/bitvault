@@ -10,7 +10,7 @@ from app.core import event_bus
 
 router = APIRouter()
 
-TOPICS = ["tick", "bar", "depth", "trade", "order", "account", "log", "risk", "strategy"]
+TOPICS = ["tick", "bar", "depth", "trade", "order", "account", "log", "risk", "strategy", "forecast"]
 
 
 @router.websocket("/ws")

@@ -52,7 +52,7 @@ class RiskEngine:
     def check_pretrade(
         self, inst_id: str, side: str, sz: float, px: float | None,
         notional: float, reduce_only: bool, source: str, instance_id: int | None = None,
-        venue: str = "okx",
+        venue: str = "okx", leverage: int = 1,
     ) -> None:
         """抛出 RiskBlocked 表示拦截。venue=paper 时跳过下单频率限制（本地撮合无交易所配额）。"""
         if inst_id not in config.INSTRUMENT_WHITELIST:
@@ -62,6 +62,12 @@ class RiskEngine:
         # 全局熔断状态：只允许减仓单
         if self.state.get("halted") and not reduce_only:
             raise RiskBlocked(f"风控熔断中，禁止开仓：{self.state.get('halt_reason')}")
+
+        # 杠杆上限强制执行（config.LEVERAGE_CAP）
+        if leverage > config.LEVERAGE_CAP and not reduce_only:
+            db.add_risk_event("leverage_cap", "error", "blocked",
+                              {"leverage": leverage, "cap": config.LEVERAGE_CAP})
+            raise RiskBlocked(f"杠杆 {leverage}x 超过上限 {config.LEVERAGE_CAP}x")
 
         r = self._rule("order_rate_limit")
         if r and r["enabled"] and venue == "okx":

@@ -1,6 +1,6 @@
 // 交易闭环表：FIFO 开平配对，展示开仓价 / 平仓价 / 资费 / 净收入，模拟盘与 OKX 通用。
 import { useEffect, useState, useCallback } from 'react';
-import { Table, Empty, Statistic, Row, Col } from 'antd';
+import { Table, Empty, Statistic, Row, Col, Tag } from 'antd';
 import { getRoundtrips } from '../api/endpoints';
 import { fmtPx, fmtTime, pnlColor } from '../utils/format';
 import type { RoundTrip, RoundTripSummary } from '../api/types';
@@ -45,6 +45,13 @@ export default function RoundTripTable({ venue, pageSize = 10 }: { venue: 'paper
 
   return (
     <div>
+      {/* venue 区分横幅：模拟盘蓝色 / OKX 实盘橙色，一眼分清 */}
+      <div
+        className={venue === 'paper' ? 'rt-venue-paper' : 'rt-venue-okx'}
+        style={{ margin: '12px 16px 0', padding: '6px 12px', borderRadius: 6, fontWeight: 600, fontSize: 13 }}
+      >
+        {venue === 'paper' ? '本地模拟盘（虚拟 USDT，自动驾驶在此通道运行）' : 'OKX 实盘账户（真实资金）'}
+      </div>
       <Row gutter={16} style={pad}>
         <Col xs={8} md={4}>
           <Statistic title="已平仓" value={data?.total ?? 0} suffix="笔" loading={loading} />
@@ -70,10 +77,14 @@ export default function RoundTripTable({ venue, pageSize = 10 }: { venue: 'paper
         rowKey={(r: RoundTrip) => `${r.open_ts}-${r.close_ts}-${r.open_px}`}
         dataSource={closed}
         loading={loading}
+        rowClassName={(r: RoundTrip) => (r.pnl > 0 ? 'rt-profit' : r.pnl < 0 ? 'rt-loss' : '')}
         pagination={closed.length > pageSize ? { pageSize, size: 'small' } : false}
         locale={{ emptyText: <Empty description="暂无已平仓交易" style={{ padding: 30 }} /> }}
         columns={[
           { title: '平仓时间', dataIndex: 'close_ts', width: 150, render: fmtTime },
+          { title: '方向', dataIndex: 'side', width: 60, render: (s: string) => (
+            <Tag color={s === 'short' ? 'red' : 'green'}>{s === 'short' ? '空' : '多'}</Tag>
+          ) },
           { title: '开仓价', dataIndex: 'open_px', width: 100, render: fmtPx },
           { title: '平仓价', dataIndex: 'close_px', width: 100, render: fmtPx },
           { title: '数量', dataIndex: 'sz', width: 90, render: (v: number) => v?.toFixed(6) },

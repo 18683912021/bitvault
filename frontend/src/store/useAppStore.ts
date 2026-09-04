@@ -8,12 +8,16 @@ interface AppState {
   risk: RiskStatus | null;
   notifications: Notification[];
   unread: number;
+  venue: 'paper' | 'okx';          // 系统级模式：切换后账户/订单/总览数据源 + autopilot 执行通道均跟随（paper 虚拟/okx 真实）
+  autopilotOn: boolean;            // 全局 autopilot 运行状态（顶栏开关同步）
   setEnv: (e: Env) => void;
   setHasKey: (b: boolean) => void;
   setWsConnected: (b: boolean) => void;
   setRisk: (r: RiskStatus) => void;
   handleRiskEvent: (data: any) => void;
   setNotifications: (n: Notification[]) => void;
+  setVenue: (v: 'paper' | 'okx') => void;
+  setAutopilotOn: (b: boolean) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -23,6 +27,8 @@ export const useAppStore = create<AppState>((set) => ({
   risk: null,
   notifications: [],
   unread: 0,
+  venue: 'paper',
+  autopilotOn: false,
   setEnv: (e) => set({ env: e }),
   setHasKey: (b) => set({ hasKey: b }),
   setWsConnected: (b) => set({ wsConnected: b }),
@@ -36,4 +42,6 @@ export const useAppStore = create<AppState>((set) => ({
     }
   },
   setNotifications: (n) => set({ notifications: n, unread: n.filter((x) => !x.read).length }),
+  setVenue: (v) => set({ venue: v }),
+  setAutopilotOn: (b) => set({ autopilotOn: b }),
 }));

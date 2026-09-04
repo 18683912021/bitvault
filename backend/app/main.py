@@ -47,6 +47,9 @@ class Services:
         self.llm: LLMClient | None = None
         self.brain: Autopilot | None = None
         self.manager: StrategyManager | None = None
+        # 系统级模式（venue）：'paper' 模拟虚拟资金 / 'okx' 实盘真实资金。
+        # autopilot 跟随此模式执行；持久化在 settings，启动恢复上次模式。
+        self.venue: str = "paper"
         # 私有连接部分
         self.env = "none"
         self.private_client: OkxClient | None = None
@@ -58,6 +61,18 @@ class Services:
 
     def has_key(self) -> bool:
         return self.private_client is not None
+
+    def set_venue(self, venue: str) -> str:
+        """切换系统级模式。okx 模式若未连 Key，自动落回 paper（安全兜底，不报错）。"""
+        if venue not in ("paper", "okx"):
+            venue = "paper"
+        if venue == "okx" and not self.has_key():
+            venue = "paper"   # 未连 Key 不能进实盘，静默落回模拟
+        self.venue = venue
+        db.set_setting("system_venue", venue)
+        log.info("系统级模式切换 → %s", venue)
+        event_bus.publish("venue", {"venue": venue})
+        return venue
 
     def strategy_registry(self):
         from app.strategy.templates import STRATEGY_REGISTRY
@@ -97,11 +112,14 @@ class Services:
         self.llm = LLMClient()
         decision_brain = DecisionBrain(self.llm)
         self.brain = Autopilot(self.data, self.paper, decision_brain, self.risk)
+        self.brain.bind_svc(self)   # 注入容器：autopilot 据此读取系统级 venue + 实盘 oms/account
         await self.brain.start()
         self.manager = StrategyManager(oms=None, risk=self.risk, account=None, data=self.data,
                                        paper_oms=self.paper)
         await self.manager.start()
         self._time_task = asyncio.create_task(self._time_loop())
+        # 10 分钟涨跌预测（事件合约参考）：每 10 秒计算并经 WS 推送到首页
+        self._forecast_task: asyncio.Task | None = asyncio.create_task(self._forecast_loop())
         # 恢复上次激活的 Key
         row = db.query_one("SELECT * FROM api_keys WHERE is_active=1 ORDER BY id DESC")
         if row:
@@ -109,7 +127,10 @@ class Services:
                 await self.rebuild_connection(row)
             except Exception as e:
                 log.error("恢复 Key 连接失败: %s", e)
-        log.info("BitVault 后端就绪 env=%s", self.env)
+        # 恢复上次系统级模式（venue）。若上次是 okx 但当前 Key 已断，set_venue 自动落回 paper。
+        saved_venue = db.get_setting("system_venue") or "paper"
+        self.venue = self.set_venue(saved_venue if isinstance(saved_venue, str) else "paper")
+        log.info("BitVault 后端就绪 env=%s venue=%s", self.env, self.venue)
 
     async def _time_loop(self) -> None:
         while True:
@@ -122,6 +143,20 @@ class Services:
                 return
             except Exception as e:
                 log.warning("时间同步失败: %s", e)
+
+    async def _forecast_loop(self) -> None:
+        from app.brain import forecast10
+
+        while True:
+            try:
+                result = forecast10.compute(self.data, "BTC-USDT")
+                if result.get("direction") != "unknown" or result.get("ref_price"):
+                    event_bus.publish("forecast", result)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.warning("预测计算异常: %s", e)
+            await asyncio.sleep(10)
 
     async def disconnect_private(self) -> None:
         if self.private_ws:
@@ -141,6 +176,12 @@ class Services:
         self.risk.oms = None
         self.risk.account = None
         self.risk.env = "none"
+        # Key 断开时若在实盘模式，安全落回模拟（autopilot 下次决策会自动用 paper 引擎）
+        if self.venue == "okx":
+            self.venue = "paper"
+            db.set_setting("system_venue", "paper")
+            event_bus.publish("venue", {"venue": "paper"})
+            log.info("Key 断开，系统级模式自动落回 paper")
         if self.manager:
             self.manager.oms = None
             self.manager.account = None
@@ -228,6 +269,8 @@ async def _lifespan(app: FastAPI):
         await svc.manager.stop()
     if svc._time_task:
         svc._time_task.cancel()
+    if getattr(svc, "_forecast_task", None):
+        svc._forecast_task.cancel()
     await svc.public_client.aclose()
 
 

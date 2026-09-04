@@ -2,11 +2,11 @@ import { Tag } from 'antd';
 import { CheckCircleFilled, ExclamationCircleFilled, MinusCircleFilled } from '@ant-design/icons';
 import type { Env } from '../api/types';
 
-// 顶部常驻环境标识（红线 §10）：DEMO 绿、LIVE 红、未连接 灰。
+// 顶部常驻环境标识：DEMO 绿、LIVE 橙（不刺眼）、未连接 灰。自动驾驶固定 paper，顶部不再用红色横幅。
 export default function EnvBadge({ env }: { env: Env }) {
   if (env === 'live') {
     return (
-      <Tag color="red" icon={<ExclamationCircleFilled />} style={{ fontWeight: 600 }}>
+      <Tag color="orange" icon={<ExclamationCircleFilled />} style={{ fontWeight: 600 }}>
         LIVE 实盘
       </Tag>
     );

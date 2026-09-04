@@ -1,6 +1,11 @@
 """OKX WebSocket 客户端：公共/私有频道、登录、心跳、指数退避重连、自动重订阅、代理支持。
 
 私有频道登录签名：base64(hmac_sha256(secret, timestamp + 'GET' + '/users/self/verify'))
+
+代理支持（websockets>=14）：
+- 自动检测环境变量 WSS_PROXY / HTTPS_PROXY / https_proxy / all_proxy
+- 通过 HTTP CONNECT 隧道穿透 HTTP 代理建立 WSS 连接
+- 如需禁用代理：设置 NO_PROXY 包含目标域名，或清空上述环境变量
 """
 from __future__ import annotations
 
@@ -13,8 +18,9 @@ import logging
 import os
 import time
 from typing import Awaitable, Callable
+from urllib.parse import urlparse
 
-import websockets
+from websockets.asyncio.client import connect as ws_connect
 
 from app.exchange.okx_client import OkxClient
 
@@ -22,12 +28,25 @@ log = logging.getLogger("bitvault.okx_ws")
 
 
 def _proxy_from_env() -> str | None:
-    return (
-        os.environ.get("WSS_PROXY")
-        or os.environ.get("HTTPS_PROXY")
-        or os.environ.get("https_proxy")
-        or os.environ.get("all_proxy")
-    )
+    """从环境变量检测代理 URL，优先级：WSS_PROXY > HTTPS_PROXY > https_proxy > all_proxy。"""
+    for key in ("WSS_PROXY", "HTTPS_PROXY", "https_proxy", "all_proxy"):
+        val = os.environ.get(key)
+        if val and val.strip():
+            return val.strip()
+    return None
+
+
+def _should_bypass_proxy(ws_url: str) -> bool:
+    """检查 NO_PROXY 规则是否匹配 WS 目标主机。"""
+    no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    if not no_proxy:
+        return False
+    host = urlparse(ws_url).hostname or ""
+    patterns = [p.strip() for p in no_proxy.split(",") if p.strip()]
+    for pat in patterns:
+        if host == pat or host.endswith("." + pat) or pat == "*":
+            return True
+    return False
 
 
 class OkxWebSocket:
@@ -99,9 +118,10 @@ class OkxWebSocket:
             try:
                 ws_kwargs: dict = {"ping_interval": None, "max_size": 2**23, "open_timeout": 15}
                 proxy = _proxy_from_env()
-                if proxy:
+                if proxy and not _should_bypass_proxy(self.url):
                     ws_kwargs["proxy"] = proxy
-                async with websockets.connect(self.url, **ws_kwargs) as ws:
+                    log.info("[%s] 使用代理: %s", self.name, proxy)
+                async with ws_connect(self.url, **ws_kwargs) as ws:
                     self._ws = ws
                     self._set_status("connected")
                     backoff = 1.0

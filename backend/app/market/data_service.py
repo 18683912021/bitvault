@@ -227,9 +227,16 @@ class DataService:
             for r in rows
         ]
 
-    def last_price(self, inst_id: str) -> float:
+    def last_price(self, inst_id: str, max_age_s: int = 30) -> float:
+        """返回最新价。max_age_s 秒内有效，过期返回 0.0（调用方应跳过交易）。"""
         t = self.tickers.get(inst_id)
-        return float(t["last"]) if t else 0.0
+        if not t:
+            return 0.0
+        ts_ms = int(t.get("ts") or 0)
+        if ts_ms > 0 and (time.time() * 1000 - ts_ms) > max_age_s * 1000:
+            log.warning("last_price 数据过期 %ss，inst=%s，拒绝使用旧价格", max_age_s, inst_id)
+            return 0.0
+        return float(t["last"])
 
     # ---------- REST 轮询兜底（WS 不通时由 REST 接管，复用 on_ws_message 解析） ----------
     def _ws_alive(self, ws=None) -> bool:

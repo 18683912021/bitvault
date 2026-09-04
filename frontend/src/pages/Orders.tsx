@@ -1,9 +1,10 @@
 import { useEffect, useState, useCallback } from 'react';
 import {
-  Card, Tabs, Table, Tag, Button, Popconfirm, Space, Empty, Typography, Segmented,
+  Card, Tabs, Table, Tag, Button, Popconfirm, Space, Empty, Typography,
 } from 'antd';
 import { ReloadOutlined, CloseCircleOutlined } from '@ant-design/icons';
 import { useOrderStore } from '../store/useOrderStore';
+import { useAppStore } from '../store/useAppStore';
 import { getOrders, getTrades, cancelOrder } from '../api/endpoints';
 import { fmtPx, fmtTime, pnlColor } from '../utils/format';
 import type { Order, OrderState } from '../api/types';
@@ -23,23 +24,23 @@ export default function Orders() {
   const setOrders = useOrderStore((s) => s.setOrders);
   const trades = useOrderStore((s) => s.trades);
   const setTrades = useOrderStore((s) => s.setTrades);
-  const [tab, setTab] = useState<'open' | 'history' | 'rt'>('open');
+  const [tab, setTab] = useState<'open' | 'history' | 'rt'>('rt');
   const [loading, setLoading] = useState(false);
-  const [rtVenue, setRtVenue] = useState<'paper' | 'okx'>('paper');
+  const rtVenue = useAppStore((s) => s.venue);          // 系统级模式（顶栏同步），整页只显示该通道订单
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
       const [o, t] = await Promise.all([
-        getOrders(tab === 'rt' ? 'open' : tab, 200),
-        getTrades(200),
+        getOrders(tab === 'rt' ? 'open' : tab, 200, rtVenue),
+        getTrades(200, rtVenue),
       ]);
       setOrders(o);
       setTrades(t);
     } finally {
       setLoading(false);
     }
-  }, [tab, setOrders, setTrades]);
+  }, [tab, rtVenue, setOrders, setTrades]);
 
   useEffect(() => {
     refresh();
@@ -68,7 +69,6 @@ export default function Orders() {
               columns={[
                 { title: '时间', dataIndex: 'created_at', width: 150, render: fmtTime },
                 { title: '标的', dataIndex: 'inst_id', width: 120 },
-                { title: '通道', dataIndex: 'venue', width: 80, render: (v: string) => v === 'paper' ? <Tag color="geekblue">本地模拟</Tag> : <Tag>OKX</Tag> },
                 { title: '方向', dataIndex: 'side', width: 60, render: (s: string) => <Tag color={s === 'buy' ? 'red' : 'green'}>{s === 'buy' ? '买' : '卖'}</Tag> },
                 { title: '类型', dataIndex: 'ord_type', width: 80 },
                 { title: '价格', dataIndex: 'px', render: fmtPx },
@@ -91,7 +91,6 @@ export default function Orders() {
               columns={[
                 { title: '时间', dataIndex: 'created_at', width: 150, render: fmtTime },
                 { title: '标的', dataIndex: 'inst_id', width: 120 },
-                { title: '通道', dataIndex: 'venue', width: 80, render: (v: string) => v === 'paper' ? <Tag color="geekblue">本地模拟</Tag> : <Tag>OKX</Tag> },
                 { title: '方向', dataIndex: 'side', width: 60, render: (s: string) => <Tag color={s === 'buy' ? 'red' : 'green'}>{s === 'buy' ? '买' : '卖'}</Tag> },
                 { title: '类型', dataIndex: 'ord_type', width: 80 },
                 { title: '价格', dataIndex: 'avg_px', render: fmtPx },
@@ -117,15 +116,7 @@ export default function Orders() {
             />
           ) },
           { key: 'rt', label: '交易闭环', children: (
-            <div>
-              <Segmented
-                value={rtVenue}
-                onChange={(v) => setRtVenue(v as 'paper' | 'okx')}
-                options={[{ label: '本地模拟', value: 'paper' }, { label: 'OKX', value: 'okx' }]}
-                style={{ margin: '4px 16px 0' }}
-              />
-              <RoundTripTable venue={rtVenue} />
-            </div>
+            <RoundTripTable key={rtVenue} venue={rtVenue} />
           ) },
         ]}
       />

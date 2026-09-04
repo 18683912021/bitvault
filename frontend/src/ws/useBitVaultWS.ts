@@ -71,6 +71,9 @@ function route(msg: WsMessage) {
     case 'trade':
       useMarketStore.getState().pushTrade(data);
       break;
+    case 'forecast':
+      useMarketStore.getState().setForecast(data);
+      break;
     case 'order':
       useOrderStore.getState().upsertOrder(data);
       break;

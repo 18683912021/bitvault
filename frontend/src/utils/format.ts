@@ -37,7 +37,7 @@ export function fmtTimeShort(ts?: number | null): string {
 
 export function pnlColor(v: number | undefined | null): string {
   if (!v) return '';
-  return v > 0 ? '#cf1322' : v < 0 ? '#3f8600' : ''; // 中国习惯：红涨绿跌
+  return v > 0 ? '#3f8600' : v < 0 ? '#cf1322' : ''; // 盈利绿、亏损红（与底色惯例一致）
 }
 
 // 常用周期选项

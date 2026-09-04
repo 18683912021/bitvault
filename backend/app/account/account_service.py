@@ -68,14 +68,21 @@ class AccountService:
                 await asyncio.sleep(15)
 
     async def refresh(self) -> dict:
-        bal = await self.client.get_balance()
-        details = bal[0] if bal else {}
-        self.summary = {
-            "env": self.env,
-            "totalEq": float(details.get("totalEq") or 0),
-            "details": details.get("details") or [],
-            "ts": int(time.time() * 1000),
-        }
+        # get_balance 独立 try：失败时保留旧 summary 但标记 stale（风控可用此判断）
+        try:
+            bal = await self.client.get_balance()
+            details = bal[0] if bal else {}
+            self.summary = {
+                "env": self.env,
+                "totalEq": float(details.get("totalEq") or 0),
+                "details": details.get("details") or [],
+                "ts": int(time.time() * 1000),
+                "stale": False,
+            }
+        except Exception as e:
+            log.warning("获取余额失败: %s — 保留旧权益数据", e)
+            if self.summary:
+                self.summary = dict(self.summary, stale=True)
         try:
             pos = await self.client.get_positions()
             self.positions = [
@@ -93,7 +100,9 @@ class AccountService:
                 for p in pos if float(p.get("pos") or 0) != 0
             ]
         except Exception as e:
-            log.warning("获取持仓失败: %s", e)
+            # 持仓获取失败 → 清空旧数据（避免幻影持仓）
+            log.warning("获取持仓失败: %s — 清空旧持仓数据防止幻影持仓", e)
+            self.positions = []
         payload = {"summary": self.summary, "positions": self.positions}
         event_bus.publish("account", payload)
 

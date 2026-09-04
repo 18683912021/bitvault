@@ -1,0 +1,47 @@
+/* 全局自定义样式 */
+
+/* 交易闭环表行底色：盈利浅绿、亏损浅红（覆盖 AntD 单元格背景） */
+.rt-profit > td,
+.ant-table-row.rt-profit > td {
+  background: #f6ffed !important;       /* 浅绿 */
+}
+.rt-profit:hover > td {
+  background: #d9f7be !important;        /* hover 深一点 */
+}
+.rt-loss > td,
+.ant-table-row.rt-loss > td {
+  background: #fff1f0 !important;       /* 浅红 */
+}
+.rt-loss:hover > td {
+  background: #ffccc7 !important;       /* hover 深一点 */
+}
+
+/* venue 横幅 */
+.rt-venue-paper {
+  background: #e6f4ff;
+  border: 1px solid #91caff;
+  color: #0958d9;
+}
+.rt-venue-okx {
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+  color: #d46b08;
+}
+
+/* 系统级模式徽章（顶栏醒目标识）：模拟蓝 / 实盘红 */
+.mode-badge-paper {
+  background: #e6f4ff !important;
+  border: 1px solid #69b1ff !important;
+  color: #0958d9 !important;
+  padding: 2px 10px !important;
+  border-radius: 6px !important;
+  font-size: 13px !important;
+}
+.mode-badge-okx {
+  background: #fff1f0 !important;
+  border: 1px solid #ffa39e !important;
+  color: #cf1322 !important;
+  padding: 2px 10px !important;
+  border-radius: 6px !important;
+  font-size: 13px !important;
+}

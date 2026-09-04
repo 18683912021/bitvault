@@ -30,6 +30,7 @@ async def status(request: Request):
     return {
         "env": s.env,
         "has_key": s.has_key(),
+        "venue": s.venue,
         "time_offset_ms": round(s.public_client._time_offset_ms) if s.public_client else 0,
         "market": s.data.status if s.data else {},
         "private_ws": s.private_ws.status if s.private_ws else "no_key",
@@ -43,6 +44,28 @@ async def status(request: Request):
             for t, c in s.strategy_registry().items()
         ],
     }
+
+
+# ================= 系统级模式（venue） =================
+@router.get("/venue")
+async def get_venue(request: Request):
+    s = svc(request)
+    return {"venue": s.venue, "has_key": s.has_key(),
+            "live_ready": s.has_key() and s.oms is not None}
+
+
+@router.post("/venue")
+async def set_venue(request: Request, body: dict):
+    """切换系统级模式：paper 模拟虚拟资金 / okx 实盘真实资金。
+    各 venue 配置独立（模式/杠杆/开关），切换时清仓位追踪 + 重置节流。"""
+    want = (body or {}).get("venue", "paper")
+    s = svc(request)
+    actual = s.set_venue(want)
+    # 切换后：autopilot 读取新 venue 的独立配置，清旧仓位追踪
+    if s.brain:
+        s.brain.on_venue_switch()
+    return {"ok": True, "venue": actual, "requested": want,
+            "fallback": want == "okx" and actual == "paper"}
 
 
 # ================= API Key 管理 =================
@@ -178,6 +201,14 @@ async def funding_rate(request: Request, instId: str = "BTC-USDT-SWAP"):
         raise HTTPException(502, str(e))
 
 
+@router.get("/market/forecast10")
+async def forecast10(request: Request, instId: str = "BTC-USDT"):
+    """10 分钟涨跌预测（事件合约参考），10 秒缓存，确定性多因子打分。"""
+    from app.brain import forecast10
+
+    return forecast10.compute(svc(request).data, instId)
+
+
 # ================= 账户 =================
 @router.get("/account/summary")
 async def account_summary(request: Request):
@@ -239,6 +270,7 @@ async def autopilot_start(request: Request, body: dict | None = None):
         raise HTTPException(400, "决策大脑未就绪")
     overrides = body or {}
     cfg = s.brain.enable(overrides=overrides if overrides else None)
+    await s.brain.start()
     return {"ok": True, "config": cfg}
 
 
@@ -248,7 +280,32 @@ async def autopilot_stop(request: Request):
     if not s.brain:
         raise HTTPException(400, "决策大脑未就绪")
     cfg = s.brain.disable()
+    await s.brain.stop()
     return {"ok": True, "config": cfg}
+
+
+@router.post("/brain/config")
+async def brain_update_config(request: Request, body: dict):
+    """更新 autopilot 配置（mode/leverage 等）。按当前 venue 独立存储。"""
+    s = svc(request)
+    if not s.brain:
+        raise HTTPException(400, "决策大脑未就绪")
+    old_cfg = s.brain.config()
+    new_cfg = {**old_cfg}
+    allowed = {"mode", "leverage", "period", "max_order_usdt", "require_setup",
+               "setup_filter", "cooldown_min", "max_opens_per_day",
+               "loss_pause_n", "loss_pause_min", "daily_loss_limit_usdt"}
+    for k in allowed:
+        if k in body:
+            new_cfg[k] = body[k]
+    lev = int(new_cfg.get("leverage", 2) or 2)
+    if lev < 1:
+        lev = 1
+    elif lev > config.LEVERAGE_CAP:
+        lev = config.LEVERAGE_CAP
+    new_cfg["leverage"] = lev
+    db.set_setting(f"autopilot_config_{s.venue}", new_cfg)
+    return {"ok": True, "config": new_cfg, "venue": s.venue}
 
 
 @router.post("/brain/decide")
@@ -344,18 +401,36 @@ async def cancel_order(request: Request, body: dict):
 
 
 @router.get("/orders")
-async def orders(request: Request, state: str = "open", limit: int = 100):
+async def orders(request: Request, state: str = "open", limit: int = 100, venue: str | None = None):
+    """订单列表。venue 传 'paper'/'okx' 时只返回该通道订单（系统级模式过滤）。"""
+    vclause = "AND venue=?" if venue else ""
+    params: list = ([venue] if venue else []) + [min(limit, 500)]
     if state == "open":
         return db.query(
-            f"SELECT * FROM orders WHERE state IN ('pending_submit','live','partially_filled') ORDER BY id DESC LIMIT ?",
-            (min(limit, 500),),
+            f"SELECT * FROM orders WHERE state IN ('pending_submit','live','partially_filled') {vclause} ORDER BY id DESC LIMIT ?",
+            tuple(params),
         )
-    return db.query("SELECT * FROM orders WHERE state NOT IN ('pending_submit','live','partially_filled') ORDER BY id DESC LIMIT ?", (min(limit, 500),))
+    return db.query(
+        f"SELECT * FROM orders WHERE state NOT IN ('pending_submit','live','partially_filled') {vclause} ORDER BY id DESC LIMIT ?",
+        tuple(params),
+    )
 
 
 @router.get("/trades")
-async def trades(request: Request, limit: int = 100):
-    return db.query("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (min(limit, 500),))
+async def trades(request: Request, limit: int = 100, venue: str | None = None):
+    """成交流水。trades 表无 venue 列，JOIN orders 取 venue（顺带修复前端通道列）；
+    传 venue 时仅返回该通道成交。"""
+    if venue:
+        return db.query(
+            "SELECT t.*, o.venue FROM trades t JOIN orders o ON t.cl_ord_id=o.cl_ord_id"
+            " WHERE o.venue=? ORDER BY t.id DESC LIMIT ?",
+            (venue, min(limit, 500)),
+        )
+    return db.query(
+        "SELECT t.*, o.venue FROM trades t LEFT JOIN orders o ON t.cl_ord_id=o.cl_ord_id"
+        " ORDER BY t.id DESC LIMIT ?",
+        (min(limit, 500),),
+    )
 
 
 @router.post("/account/close-position")

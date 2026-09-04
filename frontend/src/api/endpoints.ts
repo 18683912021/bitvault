@@ -5,11 +5,21 @@ import type {
   StrategyTemplate, StrategyInstance, BacktestListItem, BacktestDetail,
   RiskStatus, RiskEvent, Notification, AuditLog, RiskRuleEntry,
   Mode, PaperAccount, BrainStatus, BrainDecision, BrainHistory,
-  RoundTripSummary,
+  RoundTripSummary, Forecast10,
 } from './types';
 
 // ---------- 系统 ----------
 export const getStatus = () => api.get<SystemStatus>('/status');
+
+// ---------- 系统级模式（venue） ----------
+export interface VenueState {
+  venue: 'paper' | 'okx';
+  has_key: boolean;
+  live_ready?: boolean;
+}
+export const getVenue = () => api.get<VenueState>('/venue');
+export const setVenue = (venue: 'paper' | 'okx') =>
+  api.post<{ ok: boolean; venue: 'paper' | 'okx'; requested: string; fallback: boolean }>('/venue', { venue });
 
 // ---------- API Key ----------
 export interface ApiKeyRow {
@@ -44,6 +54,8 @@ export const getDepth = (instId: string) => api.get<Book5>('/market/depth', { in
 export const getMarketTrades = (instId: string) => api.get<Trade[]>('/market/trades', { instId });
 export const getFundingRate = (instId = 'BTC-USDT-SWAP') =>
   api.get<Record<string, any>>('/market/funding-rate', { instId });
+export const getForecast10 = (instId = 'BTC-USDT') =>
+  api.get<Forecast10>('/market/forecast10', { instId });
 export const downloadHistory = (body: { inst_id?: string; period?: string; days?: number }) =>
   api.post<{ ok: boolean; msg: string }>('/market/download-history', body);
 
@@ -68,9 +80,10 @@ export const placeOrder = (body: OrderIn) =>
   api.post<{ ok: boolean; order: Order }>('/order/place', body);
 export const cancelOrder = (cl_ord_id: string) =>
   api.post<{ ok: boolean; state: string }>('/order/cancel', { cl_ord_id });
-export const getOrders = (state: 'open' | 'history' = 'open', limit = 100) =>
-  api.get<Order[]>('/orders', { state, limit });
-export const getTrades = (limit = 100) => api.get<TradeRecord[]>('/trades', { limit });
+export const getOrders = (state: 'open' | 'history' = 'open', limit = 100, venue?: 'okx' | 'paper') =>
+  api.get<Order[]>('/orders', { state, limit, ...(venue ? { venue } : {}) });
+export const getTrades = (limit = 100, venue?: 'okx' | 'paper') =>
+  api.get<TradeRecord[]>('/trades', { limit, ...(venue ? { venue } : {}) });
 export const closePosition = (inst_id: string) =>
   api.post<{ ok: boolean }>('/account/close-position', { inst_id });
 export const getRoundtrips = (venue: 'paper' | 'okx' = 'paper', limit = 200, inst_id?: string) =>
@@ -86,6 +99,8 @@ export const getBrainStatus = () => api.get<BrainStatus>('/brain/status');
 export const startAutopilot = (overrides?: { period?: string; min_confidence?: number }) =>
   api.post<{ ok: boolean; config: any }>('/brain/autopilot/start', overrides || {});
 export const stopAutopilot = () => api.post<{ ok: boolean; config: any }>('/brain/autopilot/stop');
+export const updateBrainConfig = (body: Record<string, any>) =>
+  api.post<{ ok: boolean; config: any }>('/brain/config', body);
 export const decideNow = (inst_id = 'BTC-USDT', period = '5m') =>
   api.post<BrainDecision>('/brain/decide', { inst_id, period });
 export const getBrainHistory = (limit = 20) =>

@@ -24,8 +24,8 @@ INSTRUMENT_WHITELIST = ["BTC-USDT", "BTC-USDT-SWAP"]
 # 下单保护：限价 IOC 相对最新价的保护价偏移（红线 R2）
 PROTECTIVE_PX_PCT = 0.002
 
-# 合约杠杆上限（红线 R4 相关）
-LEVERAGE_CAP = 5.0
+# 合约杠杆上限（红线 R4 相关）——13x 是最大允许，不是默认杠杆
+LEVERAGE_CAP = 13
 
 # 回测默认成本
 DEFAULT_FEE_SPOT_TAKER = 0.001

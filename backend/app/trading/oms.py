@@ -32,6 +32,7 @@ class OMS:
         self.data = data
         self.env = env
         self._reconcile_task: asyncio.Task | None = None
+        self._place_lock = asyncio.Lock()
         risk.oms = self
 
     async def start(self) -> None:
@@ -54,6 +55,7 @@ class OMS:
         reduce_only = bool(intent.get("reduce_only", False))
         source = intent.get("source", "manual")
         instance_id = intent.get("instance_id")
+        leverage = int(intent.get("leverage", 1) or 1)
 
         ins = self.data.instrument(inst_id)
         if not ins:
@@ -78,92 +80,94 @@ class OMS:
             raise RiskBlocked(err)
 
         notional = px * sz_base
-        # 红线 R4：所有订单必须过事前风控
-        self.risk.check_pretrade(
-            inst_id=inst_id, side=side, sz=sz_base, px=px, notional=notional,
-            reduce_only=reduce_only, source=source, instance_id=instance_id,
-        )
-
-        # tdMode / posSide 由账户配置决定
-        is_swap = ins["instType"] == "SWAP"
-        acct_lv = str(self.account.account_config.get("acctLv") or "")
-        if is_swap and acct_lv == "1":
-            raise RiskBlocked("当前 OKX 账户为现货模式，无法交易合约，请在 OKX 端切换账户模式")
-        td_mode = "cash" if not is_swap else (intent.get("td_mode") or "isolated")
-        pos_side = self.account.pos_side_for(side, reduce_only) if is_swap else None
-
-        body: dict = {
-            "instId": inst_id,
-            "tdMode": td_mode,
-            "side": side,
-            "ordType": send_ord_type,
-            "sz": str(sz_base),
-            "clOrdId": _new_cl_ord_id(),
-        }
-        if px is not None:
-            body["px"] = str(px)
-        if is_swap:
-            body["posSide"] = pos_side
-            if reduce_only and pos_side == "net":
-                body["reduceOnly"] = True
-        # 红线 R6：交易所侧止损/止盈单
-        algo: dict = {}
-        if intent.get("sl_trigger_px"):
-            algo["slTriggerPx"] = str(self.data.round_px(inst_id, float(intent["sl_trigger_px"])))
-            algo["slOrdPx"] = "-1"  # 市价止损
-        if intent.get("tp_trigger_px"):
-            algo["tpTriggerPx"] = str(self.data.round_px(inst_id, float(intent["tp_trigger_px"])))
-            algo["tpOrdPx"] = "-1"
-        if algo:
-            body["attachAlgoOrds"] = [algo]
-
-        now = int(time.time() * 1000)
-        order_row = {
-            "cl_ord_id": body["clOrdId"], "instance_id": instance_id,
-            "inst_id": inst_id, "td_mode": td_mode, "side": side,
-            "pos_side": pos_side or "", "ord_type": send_ord_type,
-            "px": px, "sz": sz_base, "state": "pending_submit",
-            "source": source, "sl_trigger_px": float(intent["sl_trigger_px"]) if intent.get("sl_trigger_px") else None,
-            "created_at": now, "updated_at": now,
-        }
-        order_id = db.execute(
-            "INSERT INTO orders (cl_ord_id, instance_id, inst_id, td_mode, side, pos_side, ord_type,"
-            " px, sz, state, source, sl_trigger_px, created_at, updated_at)"
-            " VALUES (:cl_ord_id,:instance_id,:inst_id,:td_mode,:side,:pos_side,:ord_type,"
-            " :px,:sz,:state,:source,:sl_trigger_px,:created_at,:updated_at)",
-            order_row,
-        )
-
-        try:
-            resp = await self.client.place_order(body)
-        except OkxApiError as e:
-            db.execute(
-                "UPDATE orders SET state='failed', error_code=?, error_msg=?, updated_at=? WHERE id=?",
-                (e.code, e.msg[:200], int(time.time() * 1000), order_id),
+        # 红线 R4：风控检查 + 下单必须原子化（并发锁防止多单同时绕过仓位/风控限制）
+        async with self._place_lock:
+            self.risk.check_pretrade(
+                inst_id=inst_id, side=side, sz=sz_base, px=px, notional=notional,
+                reduce_only=reduce_only, source=source, instance_id=instance_id,
+                leverage=leverage,
             )
-            db.add_audit(source, "place_order", body, f"rejected:{e.code} {e.msg}")
-            self._publish_order(order_id)
-            raise RiskBlocked(f"交易所拒绝下单 [{e.code}] {e.msg}") from None
 
-        s_code = str(resp[0].get("sCode", "")) if resp else "-1"
-        if s_code != "0":
-            s_msg = resp[0].get("sMsg", "") if resp else ""
-            db.execute(
-                "UPDATE orders SET state='failed', error_code=?, error_msg=?, updated_at=? WHERE id=?",
-                (s_code, s_msg[:200], int(time.time() * 1000), order_id),
+            # tdMode / posSide 由账户配置决定
+            is_swap = ins["instType"] == "SWAP"
+            acct_lv = str(self.account.account_config.get("acctLv") or "")
+            if is_swap and acct_lv == "1":
+                raise RiskBlocked("当前 OKX 账户为现货模式，无法交易合约，请在 OKX 端切换账户模式")
+            td_mode = "cash" if not is_swap else (intent.get("td_mode") or "isolated")
+            pos_side = self.account.pos_side_for(side, reduce_only) if is_swap else None
+
+            body: dict = {
+                "instId": inst_id,
+                "tdMode": td_mode,
+                "side": side,
+                "ordType": send_ord_type,
+                "sz": str(sz_base),
+                "clOrdId": _new_cl_ord_id(),
+            }
+            if px is not None:
+                body["px"] = str(px)
+            if is_swap:
+                body["posSide"] = pos_side
+                if reduce_only and pos_side == "net":
+                    body["reduceOnly"] = True
+            # 红线 R6：交易所侧止损/止盈单
+            algo: dict = {}
+            if intent.get("sl_trigger_px"):
+                algo["slTriggerPx"] = str(self.data.round_px(inst_id, float(intent["sl_trigger_px"])))
+                algo["slOrdPx"] = "-1"  # 市价止损
+            if intent.get("tp_trigger_px"):
+                algo["tpTriggerPx"] = str(self.data.round_px(inst_id, float(intent["tp_trigger_px"])))
+                algo["tpOrdPx"] = "-1"
+            if algo:
+                body["attachAlgoOrds"] = [algo]
+
+            now = int(time.time() * 1000)
+            order_row = {
+                "cl_ord_id": body["clOrdId"], "instance_id": instance_id,
+                "inst_id": inst_id, "td_mode": td_mode, "side": side,
+                "pos_side": pos_side or "", "ord_type": send_ord_type,
+                "px": px, "sz": sz_base, "state": "pending_submit",
+                "source": source, "sl_trigger_px": float(intent["sl_trigger_px"]) if intent.get("sl_trigger_px") else None,
+                "created_at": now, "updated_at": now,
+            }
+            order_id = db.execute(
+                "INSERT INTO orders (cl_ord_id, instance_id, inst_id, td_mode, side, pos_side, ord_type,"
+                " px, sz, state, source, venue, sl_trigger_px, created_at, updated_at)"
+                " VALUES (:cl_ord_id,:instance_id,:inst_id,:td_mode,:side,:pos_side,:ord_type,"
+                " :px,:sz,:state,:source,'okx',:sl_trigger_px,:created_at,:updated_at)",
+                order_row,
             )
-            db.add_audit(source, "place_order", body, f"rejected:{s_code} {s_msg}")
-            self._publish_order(order_id)
-            raise RiskBlocked(f"交易所拒绝下单 [{s_code}] {s_msg}")
 
-        ord_id = resp[0].get("ordId", "")
-        db.execute(
-            "UPDATE orders SET state='live', ord_id=?, updated_at=? WHERE id=?",
-            (ord_id, int(time.time() * 1000), order_id),
-        )
-        db.add_audit(source, "place_order", body, "ok")
-        row = self._publish_order(order_id)
-        return row
+            try:
+                resp = await self.client.place_order(body)
+            except OkxApiError as e:
+                db.execute(
+                    "UPDATE orders SET state='failed', error_code=?, error_msg=?, updated_at=? WHERE id=?",
+                    (e.code, e.msg[:200], int(time.time() * 1000), order_id),
+                )
+                db.add_audit(source, "place_order", body, f"rejected:{e.code} {e.msg}")
+                self._publish_order(order_id)
+                raise RiskBlocked(f"交易所拒绝下单 [{e.code}] {e.msg}") from None
+
+            s_code = str(resp[0].get("sCode", "")) if resp else "-1"
+            if s_code != "0":
+                s_msg = resp[0].get("sMsg", "") if resp else ""
+                db.execute(
+                    "UPDATE orders SET state='failed', error_code=?, error_msg=?, updated_at=? WHERE id=?",
+                    (s_code, s_msg[:200], int(time.time() * 1000), order_id),
+                )
+                db.add_audit(source, "place_order", body, f"rejected:{s_code} {s_msg}")
+                self._publish_order(order_id)
+                raise RiskBlocked(f"交易所拒绝下单 [{s_code}] {s_msg}")
+
+            ord_id = resp[0].get("ordId", "")
+            db.execute(
+                "UPDATE orders SET state='live', ord_id=?, updated_at=? WHERE id=?",
+                (ord_id, int(time.time() * 1000), order_id),
+            )
+            db.add_audit(source, "place_order", body, "ok")
+            row = self._publish_order(order_id)
+            return row
 
     # ================= WS 订单回报 =================
     async def handle_ws_orders(self, rows: list[dict]) -> None:
@@ -172,11 +176,26 @@ class OMS:
             row = db.query_one("SELECT * FROM orders WHERE cl_ord_id=? OR ord_id=?", (cl_ord_id, r.get("ordId")))
             if not row:
                 continue
+            # OKX V5 订单状态枚举：live/partially_filled/filled/canceled/part_canceled
+            # 新增 closed（已平仓，历史订单）和 unknown 兜底
+            raw_state = r.get("state", "")
             state_map = {
-                "live": "live", "partially_filled": "partially_filled",
-                "filled": "filled", "canceled": "canceled", "partially_canceled": "partially_canceled",
+                "live": "live",
+                "partially_filled": "partially_filled",
+                "filled": "filled",
+                "canceled": "canceled",
+                "part_canceled": "partially_canceled",   # OKX V5 实际枚举
+                "partially_canceled": "partially_canceled",  # 兼容旧写法
+                "closed": "filled",
             }
-            new_state = state_map.get(r.get("state"), row["state"])
+            if raw_state in state_map:
+                new_state = state_map[raw_state]
+            elif raw_state:
+                log.warning("收到未识别的 OKX 订单状态 state=%s ordId=%s cl=%s → 标记 unknown",
+                            raw_state, r.get("ordId"), cl_ord_id)
+                new_state = "unknown"
+            else:
+                new_state = row["state"]
             filled = float(r.get("accFillSz") or 0)
             avg_px = float(r.get("avgPx") or 0) or row["avg_px"]
             fee = float(r.get("fillFee") or 0) + float(row["fee"] or 0)
@@ -291,9 +310,9 @@ class OMS:
         now = int(time.time() * 1000)
         db.execute(
             "INSERT INTO orders (cl_ord_id, ord_id, inst_id, td_mode, side, pos_side, ord_type, px, sz,"
-            " state, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " state, source, venue, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (body["clOrdId"], resp[0].get("ordId", ""), inst_id, body["tdMode"], side,
-             body.get("posSide", ""), "ioc", px, sz, "live", "risk_flatten", now, now),
+             body.get("posSide", ""), "ioc", px, sz, "live", "risk_flatten", "okx", now, now),
         )
         return True
 
@@ -317,6 +336,24 @@ class OMS:
             data = await self.client.get_order(row["inst_id"], cl_ord_id=row["cl_ord_id"])
             if data:
                 await self.handle_ws_orders([data[0]])
+            else:
+                # 订单不存在 → 标记 failed（防止 pending_submit 孤儿订单永驻）
+                db.execute(
+                    "UPDATE orders SET state='failed', error_code='not_found',"
+                    " error_msg='交易所查无此单', updated_at=? WHERE id=?",
+                    (int(time.time() * 1000), row["id"]),
+                )
+                log.warning("订单 %s 在交易所不存在 → 标记 failed", row["cl_ord_id"])
+        except OkxApiError as e:
+            if e.code in ("51601", "51404"):
+                # 51601: 订单不存在 / 51404: 订单已撤销
+                db.execute(
+                    "UPDATE orders SET state='failed', error_code=?, error_msg=?, updated_at=? WHERE id=?",
+                    (e.code, f"交易所: {e.msg}"[:200], int(time.time() * 1000), row["id"]),
+                )
+                log.warning("订单 %s 交易所返回 %s → 标记 failed", row["cl_ord_id"], e.code)
+            else:
+                log.warning("订单查询失败 %s: %s", row["cl_ord_id"], e)
         except Exception as e:
             log.warning("订单查询失败 %s: %s", row["cl_ord_id"], e)
 

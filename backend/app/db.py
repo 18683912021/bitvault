@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS orders (
     avg_px REAL, state TEXT DEFAULT 'pending_submit',
     fee REAL DEFAULT 0, source TEXT DEFAULT 'manual',
     sl_trigger_px REAL, error_code TEXT, error_msg TEXT,
+    leverage INTEGER DEFAULT 1,
     created_at INTEGER, updated_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS trades (
@@ -126,10 +127,12 @@ def init() -> None:
 
 
 def _migrate() -> None:
-    """存量库升级：orders.venue 列 + strategy_instances.mode 支持 paper。"""
+    """存量库升级：orders.venue/leverage 列 + strategy_instances.mode 支持 paper。"""
     cols = [r[1] for r in _conn.execute("PRAGMA table_info(orders)").fetchall()]
     if "venue" not in cols:
         _conn.execute("ALTER TABLE orders ADD COLUMN venue TEXT DEFAULT 'okx'")
+    if "leverage" not in cols:
+        _conn.execute("ALTER TABLE orders ADD COLUMN leverage INTEGER DEFAULT 1")
 
     row = _conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='strategy_instances'"
