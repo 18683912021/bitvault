@@ -78,7 +78,10 @@ class Services:
 
     async def start_base(self) -> None:
         db.init()
-        await self.public_client.sync_time()
+        try:
+            await self.public_client.sync_time()
+        except Exception as e:
+            log.warning("初始时间同步失败(OKX不可达): %s", e)
         await self.data.load_instruments()
         # 公共端点：tickers / books5 / trades
         self.public_ws = OkxWebSocket(
