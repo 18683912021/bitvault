@@ -31,15 +31,24 @@ class DataService:
         self.trades: dict[str, list] = {}
         # (inst_id, period) -> {"last_confirm_ts": int}
         self._confirmed: dict[tuple, int] = {}
-        self._buffer: dict[tuple, dict] = {}
         self.status = {"public_ws": "disconnected", "business_ws": "disconnected", "instruments_loaded": False}
         self.public_ws_ref = None           # 由 main 注入，用于判断 WS 健康度
         self.business_ws_ref = None         # business 端点（candle 频道）
         self._last_trade_ts: dict[str, int] = {}
         self._fallback_task: asyncio.Task | None = None
+        # 全量标的 24h 成交额（USDT），用于选标器按总值排序（随 instruments 同步刷新）
+        self.vol24h: dict[str, float] = {}
+        self._refresh_task: asyncio.Task | None = None   # 支持集定时重试同步任务
+        # 当前驾驶标的（动态可切换）：公共/K线频道只订阅它，切换时重订阅并预热 K 线
+        self.active_inst: str = config.DEFAULT_INST_ID
 
     # ---------- Instruments ----------
-    async def load_instruments(self) -> None:
+    async def load_instruments(self, refresh: bool = True) -> None:
+        """从 OKX 全量同步支持集：USDT 计价的现货 + USDT 结算的永续（state=live）。
+
+        全覆盖同步（支持哪些币=tradeable 即为支持集），供选标器与风控使用；
+        失败时保留上一次的同步结果（OKX 不可达不直接清空支持集）。
+        """
         result = {}
         for inst_type in ("SPOT", "SWAP"):
             try:
@@ -48,11 +57,17 @@ class DataService:
                 log.warning("拉取 %s instruments 失败: %s", inst_type, e)
                 continue
             for r in rows:
-                if r["instId"] not in config.INSTRUMENT_WHITELIST:
+                # 现货用 quoteCcy；永续用 settleCcy（SWAP 行的 quoteCcy 为空）
+                qc = (r.get("quoteCcy") or "") if inst_type == "SPOT" else (r.get("settleCcy") or "")
+                if qc != config.SUPPORTED_QUOTE_CCY:
+                    continue
+                if (r.get("state") or "") != "live":
                     continue
                 result[r["instId"]] = {
                     "instId": r["instId"],
                     "instType": r["instType"],
+                    "quoteCcy": r.get("quoteCcy") or "",
+                    "baseCcy": r.get("baseCcy") or "",
                     "lotSz": float(r["lotSz"]),
                     "minSz": float(r["minSz"]),
                     "tickSz": float(r["tickSz"]),
@@ -60,14 +75,121 @@ class DataService:
                     "settleCcy": r.get("settleCcy") or "",
                     "state": r.get("state"),
                 }
-        self.instruments = result
-        self.status["instruments_loaded"] = bool(result)
-        log.info("instruments 加载完成: %s", list(result))
+        if result:
+            self.instruments = result
+            config.InstrumentRegistry.reset(set(result))
+            self.status["instruments_loaded"] = True
+            await self._load_all_tickers()
+            log.info("instruments 同步完成: 现货 %d / 永续 %d",
+                     sum(1 for v in result.values() if v["instType"] == "SPOT"),
+                     sum(1 for v in result.values() if v["instType"] == "SWAP"))
+        else:
+            if not self.instruments:
+                # OKX 不可达：用兜底集垫底，保证选标器/风控可用（后台刷新会自动补齐）
+                self.instruments = self._fallback_instruments()
+                self.status["instruments_loaded"] = False
+            log.warning("instruments 同步无结果，保留 %d 个已同步标的（兜底 %s）",
+                        len(self.instruments), self.status["instruments_loaded"])
+            await self._load_all_tickers()
+
+    @staticmethod
+    def _fallback_instruments() -> dict[str, dict]:
+        """OKX 不可达时的最小兜底集：默认标的(现货)+其永续镜像。"""
+        out = {}
+        for inst_id in sorted(config.InstrumentRegistry.supported):
+            is_swap = inst_id.endswith("-SWAP")
+            out[inst_id] = {
+                "instId": inst_id, "instType": "SWAP" if is_swap else "SPOT",
+                "quoteCcy": "USDT", "baseCcy": inst_id.replace("-SWAP", "").split("-")[0],
+                "lotSz": 0.0001, "minSz": 0.0001, "tickSz": 0.01,
+                "ctVal": 0.0, "settleCcy": "USDT" if is_swap else "",
+                "state": "live",
+            }
+        return out
+
+    async def start_instrument_refresh(self) -> None:
+        """定时重试同步支持集：OKX 网络恢复或新币上线后自动补齐（每 10 分钟）。"""
+        if self._refresh_task is None:
+            self._refresh_task = asyncio.create_task(self._refresh_loop())
+
+    async def _refresh_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(600)
+                await self.load_instruments()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.warning("支持集刷新失败: %s", e)
+
+    async def _load_all_tickers(self) -> None:
+        """全量 ticker 成交额（选标器"按总值排序"的数据源）。失败不阻塞。"""
+        vols: dict[str, float] = {}
+        for inst_type in ("SPOT", "SWAP"):
+            try:
+                rows = await self.client.get_tickers(inst_type)
+            except Exception as e:
+                log.debug("全量 tickers %s 失败: %s", inst_type, e)
+                continue
+            for t in rows:
+                try:
+                    # 现货: volCcy24h 已是 USDT 金额；永续: 它是基础币数量，需乘现价换算成 USDT
+                    if inst_type == "SWAP":
+                        last = float(t.get("last") or 0)
+                        vols[t["instId"]] = float(t.get("volCcy24h") or 0) * last
+                    else:
+                        vols[t["instId"]] = float(t.get("volCcy24h") or 0)
+                except (KeyError, TypeError, ValueError):
+                    continue
+        if vols:
+            self.vol24h = vols
 
     def instrument(self, inst_id: str) -> dict | None:
         return self.instruments.get(inst_id)
 
+    def is_supported(self, inst_id: str) -> bool:
+        """标的是否在支持集内（OKX 已同步；未同步时回退到注册表兜底集合）。"""
+        return inst_id in self.instruments or config.InstrumentRegistry.contains(inst_id)
+
+    # ---------- 当前驾驶标的（切换） ----------
+    async def set_active_inst(self, inst_id: str) -> None:
+        """切换驾驶标的：退旧订新（公共+K线频道），并后台预热最近 K 线。"""
+        if inst_id == self.active_inst and inst_id in self.instruments:
+            return
+        self.active_inst = inst_id
+        if self.public_ws_ref:
+            await self.public_ws_ref.resubscribe(self.subscribe_public_channels())
+        if self.business_ws_ref:
+            await self.business_ws_ref.resubscribe(self.subscribe_business_channels())
+        self._last_trade_ts.pop(inst_id, None)  # 切标的重置去重游标，防旧成交互斥
+        asyncio.ensure_future(self._warm_bars(inst_id))
+        log.info("当前驾驶标的 → %s（频道已重订阅）", inst_id)
+
+    async def _warm_bars(self, inst_id: str, limit: int = 300) -> None:
+        """切换到新标的后的快速预热：各周期拉近期 300 根入库，决策/预测立即可用。"""
+        for period in ("1m", "5m", "15m", "1H", "4H", "1D"):
+            try:
+                await self.fetch_recent_to_db(inst_id, period, limit=limit)
+            except Exception as e:
+                log.debug("预热K线 %s %s 失败: %s", inst_id, period, e)
+            await asyncio.sleep(0.1)
+
     # ---------- 数量/价格规格化（向下取整，红线 R2/R5 相关） ----------
+    def calculate_notional(self, inst_id: str, sz: float, px: float) -> float:
+        """统一名义金额（P0-6）：现货 = 币数量×价格；合约 SWAP = 张数×价格×ctVal。
+
+        全系统（风控/仓位/纸面/OMS/PnL/保证金）共用此口径；规格缺失时抛错（fail-closed）。"
+        """
+        ins = self.instrument(inst_id)
+        if not ins:
+            raise ValueError(f"未知标的 {inst_id}，无法计算名义金额")
+        if ins["instType"] != "SWAP":
+            return round(px * sz, 8)
+        ctval = float(ins.get("ctVal") or 0)
+        if ctval <= 0:
+            raise ValueError(f"{inst_id} 合约规格缺失 ctVal，禁止按错误口径交易")
+        return round(px * sz * ctval, 8)
+
     def normalize_sz(self, inst_id: str, sz: float) -> tuple[float, str | None]:
         """返回 (规格化数量, 错误)。SWAP 转为整数张。"""
         ins = self.instrument(inst_id)
@@ -151,25 +273,21 @@ class DataService:
                     self._confirmed[key] = ts
                     db.upsert_bars([(inst_id, period, ts, o, h, l, c, vol, vol_ccy, "ws")])
                     event_bus.publish("bar", bar)
-            else:
-                self._buffer[key] = bar  # 未收盘，仅缓存不发布
+            # 未收盘 bar 无消费者（P2-3：原 _buffer 从未被读取，已删除）
 
     def subscribe_public_channels(self) -> list[dict]:
-        """公共端点频道：tickers / books5 / trades（不含 candle，candle 在 business 端点）。"""
-        args = []
-        for inst_id in config.INSTRUMENT_WHITELIST:
-            args.append({"channel": "tickers", "instId": inst_id})
-            args.append({"channel": "books5", "instId": inst_id})
-            args.append({"channel": "trades", "instId": inst_id})
-        return args
+        """公共端点频道（仅当前驾驶标的）：tickers / books5 / trades。"""
+        return [
+            {"channel": ch, "instId": self.active_inst}
+            for ch in ("tickers", "books5", "trades")
+        ]
 
     def subscribe_business_channels(self) -> list[dict]:
-        """business 端点频道：candle* K 线（公共端点自 OKX 升级后不再支持 candle）。"""
-        args = []
-        for inst_id in config.INSTRUMENT_WHITELIST:
-            for period in ("1m", "5m", "15m", "1H", "4H", "1D"):
-                args.append({"channel": f"candle{period}", "instId": inst_id})
-        return args
+        """business 端点频道（仅当前驾驶标的）：candle* K 线。"""
+        return [
+            {"channel": f"candle{period}", "instId": self.active_inst}
+            for period in ("1m", "5m", "15m", "1H", "4H", "1D")
+        ]
 
     # 兼容旧入口（保留方法名，返回公共频道，避免历史调用方破坏）
     def subscribe_channels(self) -> list[dict]:
@@ -263,29 +381,26 @@ class DataService:
                 self.status["public_ws"] = "connected" if pub_alive else "rest_fallback"
                 self.status["business_ws"] = "connected" if biz_alive else "rest_fallback"
 
-                # ---- 公共端点 ----
+                # ---- 公共端点（仅当前驾驶标的） ----
                 if not pub_alive:
-                    for inst_id in config.INSTRUMENT_WHITELIST:
-                        await self._poll_ticker(inst_id)
-                        await self._poll_books(inst_id)
-                        if tick % 2 == 0:
-                            await self._poll_trades(inst_id)
+                    await self._poll_ticker(self.active_inst)
+                    await self._poll_books(self.active_inst)
+                    if tick % 2 == 0:
+                        await self._poll_trades(self.active_inst)
                 # ---- K 线端点 ----
                 if biz_alive:
                     # business 健康：每 ~30s 补一次最近 K 线入库（供回测，不打 bar 事件）
                     if tick % 15 == 0:
-                        for inst_id in config.INSTRUMENT_WHITELIST:
-                            for period in ("1m", "5m", "15m", "1H", "4H", "1D"):
-                                try:
-                                    await self.fetch_recent_to_db(inst_id, period, limit=100)
-                                except Exception as e:
-                                    log.debug("补K失败 %s %s: %s", inst_id, period, e)
+                        for period in ("1m", "5m", "15m", "1H", "4H", "1D"):
+                            try:
+                                await self.fetch_recent_to_db(self.active_inst, period, limit=100)
+                            except Exception as e:
+                                log.debug("补K失败 %s %s: %s", self.active_inst, period, e)
                 else:
                     # business 不通：REST 接管 K 线（打 bar 事件让前端可见）
                     if tick % 3 == 0:
-                        for inst_id in config.INSTRUMENT_WHITELIST:
-                            for period in ("1m", "5m", "15m", "1H", "4H", "1D"):
-                                await self._poll_candles(inst_id, period)
+                        for period in ("1m", "5m", "15m", "1H", "4H", "1D"):
+                            await self._poll_candles(self.active_inst, period)
                 tick += 1
             except asyncio.CancelledError:
                 return

@@ -157,6 +157,10 @@ class OkxClient:
     async def get_ticker(self, inst_id: str) -> list[dict]:
         return await self.request("GET", "/api/v5/market/ticker", {"instId": inst_id}, auth=False)
 
+    async def get_tickers(self, inst_type: str) -> list[dict]:
+        """全量 tickers（按市场类型一次拉取，用于成交额排序）。"""
+        return await self.request("GET", "/api/v5/market/tickers", {"instType": inst_type}, auth=False)
+
     async def get_candles(self, inst_id: str, bar: str, limit: int = 300, after: int | None = None) -> list[list]:
         return await self.request(
             "GET", "/api/v5/market/candles",

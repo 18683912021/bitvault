@@ -51,16 +51,16 @@ class BTParams:
     tp3_r: float = 3.0
     trail_atr: float = 2.5
     time_stop_bars: int = 120
-    risk_pct: float = 0.005
+    risk_pct: float = 0.01   # P1-1 与实盘 RISK_PER_TRADE_PCT=1% 对齐（原 0.5%）
     cooldown_bars: int = 3         # 15min / 5m
     max_opens_per_day: int = 20
     loss_pause_n: int = 3
     loss_pause_bars: int = 12      # 60min / 5m
     allow_short: bool = True       # SPOT 实盘只执行 long；short 信号仅统计评估
-    require_setup: bool = False    # True: 无形态（none）禁止开仓（实验 A）
+    require_setup: bool = True     # P1-1 与实盘默认一致（原 False 会悄悄放行无形态）
     signal_exit_only_loss: bool = False  # True: Signal Exit 仅在浮亏时触发（实验 B）
-    signal_exit_bars: int = 2   # Signal Exit 需连续 N 根收盘<EMA21（过滤噪音；=1 旧逻辑）
-    setup_filter: str = ""     # 非空则只允许该 setup（"breakout_retest"|"pullback"）
+    signal_exit_bars: int = 1   # P1-1 与实盘一致（单根确认）
+    setup_filter: str = "breakout_retest"   # P1-1 与实盘默认一致（仅突破回踩）
     fee_taker: float = 0.001
     slippage: float = 0.0002
     initial_equity: float = 10_000.0
@@ -263,13 +263,14 @@ def run_rules_backtest(bars: list[dict], bars_4h: list[dict], bars_1h: list[dict
                        end_ms: int | None = None) -> dict:
     """主入口。bars 为升序 [{ts,o,h,l,c,vol}]。
 
+    P2-3：参数覆盖 signal_engine 常量，函数结束（含异常）即恢复，防进程内污染。
     start_ms：交易/净值统计起点（之前的数据只作指标 warmup，不计收益）。
     end_ms  ：交易/净值统计终点（达到即停止交易并强平尾仓）。
               Holdout 守卫：开发脚本传 dev_end_ms(period) 截断，确保不触达 Holdout 段。
     返回 {metrics, journal, equity, params}。
     """
     p = params or BTParams()
-    _apply_params(p)
+    _orig_params = _apply_params(p)   # P2-3：记录原值，出口恢复
     pm = PERIOD_MS[period]
 
     # ---- HTF 趋势预计算：trend 只依赖已收盘 HTF bar（收盘时刻 = open_time + period_ms） ----
@@ -440,10 +441,20 @@ def run_rules_backtest(bars: list[dict], bars_4h: list[dict], bars_1h: list[dict
 
             if best:                                   # 多空均可执行
                 _side, score, plan, setup, factors = best
-                notional, _note = se.position_size(
-                    equity, equity, plan, dd, sim.loss_streak, p.max_order_usdt,
-                    fee_taker=p.fee_taker)
-                if notional >= 1.0:
+                # P1-1 风险降档模拟（与实盘 _risk_tier 同公式；连亏/日亏无逐笔等价数据，按 0）
+                if dd >= 6.0 or sim.loss_streak >= 5:
+                    best = None                         # paused：暂停开仓
+                else:
+                    mult = 1.0
+                    if dd >= 4.0 or sim.loss_streak >= 3:
+                        mult = 0.25
+                    elif dd >= 3.0 or sim.loss_streak >= 2:
+                        mult = 0.5
+                    notional, _note = se.position_size(
+                        equity, equity, plan, dd, sim.loss_streak, p.max_order_usdt,
+                        fee_taker=p.fee_taker)
+                    notional *= mult
+                if best and notional >= 1.0:
                     is_short = _side == "short"
                     fill = bars[i + 1]["o"] * (1 - p.slippage if is_short else 1 + p.slippage)
                     sim.open_pos(notional, fill, plan, score, setup, factors,
@@ -475,6 +486,7 @@ def run_rules_backtest(bars: list[dict], bars_4h: list[dict], bars_1h: list[dict
             sim.close_full(tail_px, "回测结束强平", bars[-1]["ts"])
             equity_curve.append({"ts": bars[-1]["ts"] + pm, "equity": round(sim.cash, 2)})
 
+    _restore_params(_orig_params)   # P2-3：回测结束恢复模块常量（防进程内污染实盘）
     return {
         "metrics": _metrics(sim, equity_curve, p, period),
         "journal": sim.journal,

@@ -59,7 +59,7 @@ def s1_gap_through_stop():
     warmup = 30 * 86_400_000
     bars = _load_bars("1H", dev_start - warmup, dev_end)
     bars_4h = _load_bars("4H", dev_start - warmup, dev_end)
-    bars_1h = _load_bars("1H", dev_start - warmup, dev_end)
+    bars_1h = _load_bars("1D", dev_start - warmup, dev_end)   # P2-4: 1H 交易的 mid-HTF 应为 1D（原误装 1H）
     p = BTParams(require_setup=True, allow_short=False, slippage=0.0002)
     r = run_rules_backtest(bars, bars_4h, bars_1h, p, "1H", start_ms=dev_start, end_ms=dev_end)
     j = r["journal"]
@@ -91,7 +91,7 @@ def s2_all_loss_sequence():
     warmup = 30 * 86_400_000
     bars = _load_bars("1H", dev_start - warmup, dev_end)
     bars_4h = _load_bars("4H", dev_start - warmup, dev_end)
-    bars_1h = _load_bars("1H", dev_start - warmup, dev_end)
+    bars_1h = _load_bars("1D", dev_start - warmup, dev_end)   # P2-4: 1H 交易的 mid-HTF 应为 1D（原误装 1H）
     p = BTParams(require_setup=True, allow_short=False)
     r = run_rules_backtest(bars, bars_4h, bars_1h, p, "1H", start_ms=dev_start, end_ms=dev_end)
     m = r["metrics"]
@@ -130,7 +130,7 @@ def s3_high_vol_subperiod():
     warmup = 30 * 86_400_000
     bars = _load_bars("1H", seg_start - warmup, seg_end)
     bars_4h = _load_bars("4H", seg_start - warmup, seg_end)
-    bars_1h = _load_bars("1H", seg_start - warmup, seg_end)
+    bars_1h = _load_bars("1D", seg_start - warmup, seg_end)   # P2-4: 1H 交易的 mid-HTF 应为 1D（原误装 1H）
     p = BTParams(require_setup=True, allow_short=False)
     r = run_rules_backtest(bars, bars_4h, bars_1h, p, "1H", start_ms=seg_start, end_ms=seg_end)
     m = r["metrics"] or {}
@@ -152,7 +152,7 @@ def s4_mc_summary():
     warmup = 30 * 86_400_000
     bars = _load_bars("1H", dev_start - warmup, dev_end)
     bars_4h = _load_bars("4H", dev_start - warmup, dev_end)
-    bars_1h = _load_bars("1H", dev_start - warmup, dev_end)
+    bars_1h = _load_bars("1D", dev_start - warmup, dev_end)   # P2-4: 1H 交易的 mid-HTF 应为 1D（原误装 1H）
     p = BTParams(require_setup=True, allow_short=False)
     r = run_rules_backtest(bars, bars_4h, bars_1h, p, "1H", start_ms=dev_start, end_ms=dev_end)
     mc = r["metrics"].get("monte_carlo") or {}

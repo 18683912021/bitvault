@@ -9,6 +9,7 @@ interface AppState {
   notifications: Notification[];
   unread: number;
   venue: 'paper' | 'okx';          // 系统级模式：切换后账户/订单/总览数据源 + autopilot 执行通道均跟随（paper 虚拟/okx 真实）
+  instId: string;                  // 当前驾驶标的（币种+合约/现货，如 BTC-USDT / BTC-USDT-SWAP）
   autopilotOn: boolean;            // 全局 autopilot 运行状态（顶栏开关同步）
   setEnv: (e: Env) => void;
   setHasKey: (b: boolean) => void;
@@ -17,6 +18,7 @@ interface AppState {
   handleRiskEvent: (data: any) => void;
   setNotifications: (n: Notification[]) => void;
   setVenue: (v: 'paper' | 'okx') => void;
+  setInstId: (id: string) => void;
   setAutopilotOn: (b: boolean) => void;
 }
 
@@ -28,6 +30,7 @@ export const useAppStore = create<AppState>((set) => ({
   notifications: [],
   unread: 0,
   venue: 'paper',
+  instId: 'BTC-USDT',
   autopilotOn: false,
   setEnv: (e) => set({ env: e }),
   setHasKey: (b) => set({ hasKey: b }),
@@ -43,5 +46,6 @@ export const useAppStore = create<AppState>((set) => ({
   },
   setNotifications: (n) => set({ notifications: n, unread: n.filter((x) => !x.read).length }),
   setVenue: (v) => set({ venue: v }),
+  setInstId: (id) => set({ instId: id }),
   setAutopilotOn: (b) => set({ autopilotOn: b }),
 }));

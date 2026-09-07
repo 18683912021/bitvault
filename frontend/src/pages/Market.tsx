@@ -6,6 +6,7 @@ import {
 import { ReloadOutlined } from '@ant-design/icons';
 import LightweightChart from '../components/LightweightChart';
 import ConfirmSlider from '../components/ConfirmSlider';
+import InstrumentSelect from '../components/InstrumentSelect';
 import { useAppStore } from '../store/useAppStore';
 import { useMarketStore } from '../store/useMarketStore';
 import { useAccountStore } from '../store/useAccountStore';
@@ -13,11 +14,10 @@ import { getCandles, placeOrder, cancelOrder, closePosition, getOrders } from '.
 import { PERIODS, fmtPx, fmtTimeShort, pnlColor } from '../utils/format';
 import type { Candle } from '../api/types';
 
-const INSTRUMENTS = ['BTC-USDT', 'BTC-USDT-SWAP'];
-
 export default function Market() {
   const env = useAppStore((s) => s.env);
   const hasKey = useAppStore((s) => s.hasKey);
+  const sysInst = useAppStore((s) => s.instId);
   const instId = useMarketStore((s) => s.instId);
   const period = useMarketStore((s) => s.period);
   const setInstId = useMarketStore((s) => s.setInstId);
@@ -31,6 +31,14 @@ export default function Market() {
   const [loading, setLoading] = useState(false);
   const [form] = Form.useForm();
   const isSwap = instId.endsWith('-SWAP');
+  const base = (instId || 'BTC-USDT').replace(/-SWAP$/, '').split('-')[0];
+  const unit = isSwap ? '张' : base;
+
+  // 驾驶标的切换后，行情页浏览数据跟随（K线/盘口/成交按系统标的取）
+  useEffect(() => {
+    setInstId(sysInst);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sysInst]);
   const curPos = positions.find((p) => p.instId === instId);
 
   // 切换标的/周期时拉历史 K 线
@@ -79,7 +87,7 @@ export default function Market() {
     } else {
       Modal.confirm({
         title: '确认下单？',
-        content: `${vals.side === 'buy' ? '买入' : '卖出'} ${vals.sz_base} BTC @ ${vals.ord_type === 'market' ? '市价(保护价)' : vals.px}`,
+        content: `${vals.side === 'buy' ? '买入' : '卖出'} ${vals.sz_base} ${base} @ ${vals.ord_type === 'market' ? '市价(保护价)' : vals.px}`,
         okText: '确认',
         cancelText: '取消',
         onOk: () => doSubmit(vals),
@@ -122,12 +130,10 @@ export default function Market() {
         styles={{ body: { padding: '8px 16px' } }}
       >
         <Space wrap>
-          <Select
-            value={instId}
-            onChange={setInstId}
-            options={INSTRUMENTS.map((i) => ({ value: i, label: i }))}
-            style={{ width: 160 }}
-          />
+          <InstrumentSelect switcher />
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            （切换即驾驶标的，需确认）
+          </Typography.Text>
           <Segmented value={period} onChange={(v) => setPeriod(v as string)} options={[...PERIODS]} />
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             买一 {fmtPx(bestBid)} / 卖一 {fmtPx(bestAsk)} / 价差 {fmtPx(spread)}
@@ -222,11 +228,11 @@ export default function Market() {
                     </Form.Item>
                   </Col>
                 </Row>
-                <Form.Item name="sz_base" label="数量 (BTC)">
+                <Form.Item name="sz_base" label={`数量 (${unit})`}>
                   <InputNumber style={{ width: '100%' }} step={0.001} min={0} />
                 </Form.Item>
                 <Form.Item name="szSlider" label="">
-                  <Slider min={0} max={isSwap ? 1 : 1} step={0.001} tooltip={{ formatter: (v) => `${v} BTC` }}
+                  <Slider min={0} max={1} step={0.001} tooltip={{ formatter: (v) => `${v} ${unit}` }}
                     onChange={(v) => form.setFieldValue('sz_base', Number(v))}
                   />
                 </Form.Item>
@@ -258,7 +264,7 @@ export default function Market() {
                   <Col span={8}><Typography.Text type="secondary">方向/数量</Typography.Text></Col>
                   <Col span={16}>
                     <Tag color={curPos.pos > 0 ? 'red' : 'green'}>{curPos.pos > 0 ? '多' : '空'}</Tag>
-                    {curPos.pos} {isSwap ? '张' : 'BTC'}
+                    {curPos.pos} {unit}
                   </Col>
                 </Row>
                 <Row>

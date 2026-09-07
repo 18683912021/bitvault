@@ -8,6 +8,7 @@ import {
   DeleteOutlined, ReloadOutlined, ProfileOutlined, ThunderboltOutlined,
 } from '@ant-design/icons';
 import ParamForm, { schemaDefaults } from '../components/ParamForm';
+import InstrumentSelect from '../components/InstrumentSelect';
 import { useAppStore } from '../store/useAppStore';
 import { useStrategyStore } from '../store/useStrategyStore';
 import {
@@ -181,7 +182,7 @@ export default function Strategies() {
           <Row gutter={8}>
             <Col span={12}>
               <Form.Item label="标的" name="inst_id" rules={[{ required: true }]}>
-                <Select options={[{ value: 'BTC-USDT', label: 'BTC-USDT 现货' }, { value: 'BTC-USDT-SWAP', label: 'BTC-USDT-SWAP 永续' }]} />
+                <InstrumentSelect />
               </Form.Item>
             </Col>
             <Col span={6}>
@@ -267,14 +268,14 @@ function startIt(r: StrategyInstance) {
 function AutopilotCard() {
   const [status, setStatus] = useState<any>(null);
   const [history, setHistory] = useState<any[]>([]);
-  const [period, setPeriod] = useState<'5m' | '15m' | '1H' | '4H'>('1H');
+  const [period, setPeriod] = useState<string>('5m');
   const [minConf, setMinConf] = useState(0.4);
 
   const load = () => {
     getBrainStatus().then(s => {
       setStatus(s);
       const p = s?.period;
-      if (p === '5m' || p === '15m' || p === '1H' || p === '4H') setPeriod(p);
+      if ((PERIODS as readonly string[]).includes(p)) setPeriod(p);
     }).catch(() => {});
     getBrainHistory(5).then(setHistory).catch(() => {});
   };
@@ -313,7 +314,7 @@ function AutopilotCard() {
       extra={(
         <Space>
           <Select size="small" value={period} onChange={setPeriod} style={{ width: 80 }}
-            options={[{ value: '5m', label: '5m' }, { value: '15m', label: '15m' }, { value: '1H', label: '1H' }, { value: '4H', label: '4H' }]} />
+            options={PERIODS.map((p) => ({ value: p, label: p }))} />
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>阈值</Typography.Text>
           <InputNumber size="small" min={0} max={1} step={0.1} value={minConf} onChange={(v) => setMinConf(v || 0.4)} style={{ width: 70 }} />
           <Switch checked={!!status?.enabled} onChange={toggle}

@@ -190,17 +190,18 @@ class PaperEngine:
             close_px = liq_px
             close_side = "sell" if side == "long" else "buy"
             now = int(time.time() * 1000)
+            clid = _new_cl_ord_id()   # F5 修复：爆仓 order 与 trade 使用同一 cl_ord_id，避免 roundtrips 丢行
             db.execute(
                 "INSERT INTO orders (cl_ord_id, inst_id, td_mode, side, ord_type, px, sz,"
-                " state, source, venue, leverage, created_at, updated_at)"
+                " state, source, venue, leverage, reduce_only, created_at, updated_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (_new_cl_ord_id(), inst_id, "isolated", close_side, "liquidation",
-                 close_px, sz, "filled", "autopilot:liquidation", "paper", lev, now, now),
+                (clid, inst_id, "isolated", close_side, "liquidation",
+                 close_px, sz, "filled", "autopilot:liquidation", "paper", lev, 1, now, now),
             )
             db.execute(
                 "INSERT INTO trades (ord_id, cl_ord_id, inst_id, side, px, sz, fee, instance_id, ts)"
                 " VALUES (?,?,?,?,?,?,?,?,?)",
-                ("", _new_cl_ord_id(), inst_id, close_side, close_px, sz, 0, None, now),
+                ("", clid, inst_id, close_side, close_px, sz, 0, None, now),
             )
             db.add_audit("system", "paper_liquidation",
                          {"inst_id": inst_id, "sz": sz, "entry": entry,
@@ -219,6 +220,8 @@ class PaperEngine:
 
     # ---------- 下单（唯一管道，接口对齐 OMS.place_intent） ----------
     async def place_intent(self, intent: dict) -> dict:
+        from app.core.trade_intent import validate_intent
+        validate_intent(intent)   # 统一 TradeIntent 契约（P2-4）
         inst_id = intent["inst_id"]
         side = intent["side"]
         ord_type = intent.get("ord_type", "market")
@@ -254,7 +257,10 @@ class PaperEngine:
         if sz_base <= 0:
             raise RiskBlocked("下单数量为 0")
 
-        notional = px * sz_base
+        try:
+            notional = self.data.calculate_notional(inst_id, sz_base, px)   # P0-6 统一口径（SWAP×ctVal）
+        except ValueError as e:
+            raise RiskBlocked(str(e))
         # 红线 R4：事前风控（白名单/单笔限额/熔断），与实盘同一套规则；
         # 频率限制仅对 okx 通道生效（本地撮合无交易所配额）
         self.risk.check_pretrade(
@@ -315,10 +321,10 @@ class PaperEngine:
         now = int(time.time() * 1000)
         order_id = db.execute(
             "INSERT INTO orders (cl_ord_id, instance_id, inst_id, td_mode, side, pos_side, ord_type,"
-            " px, sz, state, source, venue, leverage, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " px, sz, state, source, venue, leverage, reduce_only, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (_new_cl_ord_id(), instance_id, inst_id, td_mode, side, pos_side, send_ord_type,
-             px, sz_base, "live", source, "paper", leverage, now, now),
+             px, sz_base, "live", source, "paper", leverage, 1 if reduce_only else 0, now, now),
         )
         db.add_audit(source, "paper_place", {"instId": inst_id, "side": side,
                                              "ordType": send_ord_type, "px": px, "sz": sz_base,
@@ -356,7 +362,12 @@ class PaperEngine:
         sz = float(row["sz"])
         maker = row["ord_type"] in ("limit", "post_only")
         fee_rate = FEE_MAKER if maker else FEE_TAKER
-        notional = px * sz
+        try:
+            notional = self.data.calculate_notional(inst_id, sz, px)   # P0-6：SWAP×ctVal 统一口径
+        except ValueError as e:
+            log.error("纸面成交取消（规格缺失）：%s", e)
+            return
+        ctval = max(float((self.data.instrument(inst_id) or {}).get("ctVal") or 0), 1.0)
         fee = notional * fee_rate
         leverage = int(row.get("leverage", 1) or 1)
 
@@ -401,7 +412,7 @@ class PaperEngine:
                 entry = float(lp["entry_px"])
                 lp_margin = float(lp["margin"])
                 lp_sz = float(lp["sz"])
-                pnl = (px - entry) * sz
+                pnl = (px - entry) * sz * ctval
                 margin_portion = lp_margin * (sz / lp_sz) if lp_sz > 0 else 0
                 usdt += margin_portion + pnl - fee
                 new_sz = lp_sz - sz
@@ -419,7 +430,7 @@ class PaperEngine:
                 entry = float(lp["entry_px"])
                 lp_margin = float(lp["margin"])
                 lp_sz = float(lp["sz"])
-                pnl = (entry - px) * sz  # 空头：跌了赚
+                pnl = (entry - px) * sz * ctval  # 空头：跌了赚
                 margin_portion = lp_margin * (sz / lp_sz) if lp_sz > 0 else 0
                 usdt += margin_portion + pnl - fee
                 new_sz = lp_sz - sz

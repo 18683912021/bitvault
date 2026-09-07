@@ -44,13 +44,14 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 # ================= Entry Setup 识别（模式 A 趋势回调 / 模式 B 突破回踩） =================
 def detect_setup(candles: list[dict], factors: dict, side: str) -> dict:
-    """识别入场形态。返回 {"setup": "pullback"|"breakout_retest"|"none", "why": str}。
+    """识别入场形态。返回 {"setup": ..., "why": str, "detail": {...}}。
 
+    detail 为结构判定明细（broke/retest/level 等），纯信息暴露，不参与任何判定；
     只用已收盘 K 线；形态识别为加分项（结构分），硬性入场由守卫决定。
     """
     n = len(candles)
     if n < 25:
-        return {"setup": "none", "why": "K线不足"}
+        return {"setup": "none", "why": "K线不足", "detail": {"kind": "none"}}
     highs = [c["h"] for c in candles]
     lows = [c["l"] for c in candles]
     closes = [c["c"] for c in candles]
@@ -60,7 +61,7 @@ def detect_setup(candles: list[dict], factors: dict, side: str) -> dict:
     atr = float(factors.get("atr_14", 0)) or last * 0.002
     long_side = side == "long"
 
-    setup, why = "none", ""
+    setup, why, detail = "none", "", {"kind": "none"}
 
     # ---- 模式 A：趋势回调（价格回踩 EMA21 附近 + 反转确认） ----
     # 回踩：最近 6 根内 low 触及 EMA21 ± 0.5×ATR（多单）；反抽：high 触及（空单）
@@ -75,6 +76,11 @@ def detect_setup(candles: list[dict], factors: dict, side: str) -> dict:
               (last < ema21 and closes[-1] < closes[-2])
     if touched and confirm:
         setup, why = "pullback", "回踩 EMA21 后反转确认"
+        detail = {"kind": "pullback", "touched": touched, "confirm": confirm,
+                  "level": round(ema21, 2)}
+    else:
+        detail = {"kind": "attempt" if touched else "none", "touched": touched,
+                  "confirm": confirm, "level": round(ema21, 2)}
 
     # ---- 模式 B：突破回踩（突破近 40 根极值 + 突破强度 + 回踩到 level 附近不破） ----
     if setup == "none" and n >= 40:
@@ -99,8 +105,17 @@ def detect_setup(candles: list[dict], factors: dict, side: str) -> dict:
                                 for i in range(n - 2, n))
         if broke and retest_ok:
             setup, why = "breakout_retest", f"突破 {'高点' if long_side else '低点'} {level:.0f}+强度确认 回踩不破"
+            detail = {"kind": "breakout_retest", "broke": True, "retest": True,
+                      "level": round(level, 2), "atr": round(atr, 2),
+                      "long_side": long_side}
+        else:
+            # 暴露"只突破未回踩/未突破"，供报告区分普通回踩 vs 突破回踩
+            detail = {"kind": "breakout_attempt" if broke else "no_breakout",
+                      "broke": broke, "retest": retest_ok,
+                      "level": round(level, 2), "atr": round(atr, 2),
+                      "long_side": long_side}
 
-    return {"setup": setup, "why": why or "无明确形态（观望）"}
+    return {"setup": setup, "why": why or "无明确形态（观望）", "detail": detail}
 
 
 # ================= 评分体系（纯规则 0-100） =================
@@ -345,10 +360,10 @@ def plan_trade(candles: list[dict], factors: dict, side: str) -> dict:
     return out
 
 
-# ================= No-Trade Filter + 硬守卫链（十项） =================
+# ================= No-Trade Filter + 硬守卫链（十一项） =================
 def check_gate(candles: list[dict], factors: dict, side: str, score: int, plan: dict,
                ctx: dict) -> tuple[bool, list[dict]]:
-    """十项守卫。全部通过才放行。ctx 需含：htf_4h / htf_1h / halted / drawdown_pct / loss_streak。
+    """十一项守卫（P1-9 文档修正：实为 11 项，含 liq_safety）。全部通过才放行。ctx 需含：htf_4h / htf_1h / halted / drawdown_pct / loss_streak。
 
     返回 (是否放行, 检查明细)。
     """
@@ -486,7 +501,7 @@ def check_gate(candles: list[dict], factors: dict, side: str, score: int, plan: 
 def position_size(equity: float, avail_usdt: float, plan: dict, drawdown_pct: float,
                   loss_streak: int, max_order_usdt: float,
                   fee_taker: float = FEE_TAKER, leverage: int = 1) -> tuple[float, str]:
-    """风险预算仓位：单笔最大亏损 = 权益 × 0.5%。
+    """风险预算仓位：单笔最大亏损 = 权益 × 1.0%（RISK_PER_TRADE_PCT）。
 
     衰减档：连亏≥2 ×0.75；连亏≥3 ×0.5；回撤≥3% ×0.5（叠加）。
     禁止马丁格尔：无任何加仓/加倍路径，亏损后只降不升。
@@ -509,7 +524,7 @@ def position_size(equity: float, avail_usdt: float, plan: dict, drawdown_pct: fl
     if risk_dist <= 0:
         return 0.0, "止损距离为 0"
     notional = risk_usdt / (risk_dist / float(plan["entry"]))
-    notes = [f"风险 {risk_usdt:.2f}U（0.5%×权益{f'×衰减{mult:.2f}' if mult < 1 else ''}）÷止损距离 {risk_dist:.0f}"]
+    notes = [f"风险 {risk_usdt:.2f}U（1%%×权益{f'×衰减{mult:.2f}' if mult < 1 else ''}）÷止损距离 {risk_dist:.0f}"]
     notional = min(notional, max_order_usdt)
     notes.append(f"单笔上限 {max_order_usdt:.0f}U")
     notional = min(notional, avail_usdt * leverage / (1 + leverage * fee_taker) * 0.995)

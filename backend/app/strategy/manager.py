@@ -182,6 +182,13 @@ class StrategyManager:
         event_bus.publish("strategy", {"event": "started", "instance_id": instance_id})
         return {"ok": True, "status": status}
 
+    def _mode_of_row(self, row: dict) -> str:
+        return (row or {}).get("mode", "paper")
+
+    def _mode_of(self, instance_id: int) -> str:
+        r = db.query_one("SELECT mode FROM strategy_instances WHERE id=?", (instance_id,))
+        return r["mode"] if r else "paper"
+
     def _type_of(self, row: dict) -> str:
         s = db.query_one("SELECT type FROM strategies WHERE id=?", (row["strategy_id"],))
         return s["type"] if s else ""
@@ -196,7 +203,12 @@ class StrategyManager:
                 await rt["strategy"].on_stop()
             except Exception as e:
                 log.warning("on_stop 异常: %s", e)
-            await self.oms.cancel_instance_orders(instance_id)
+            # P0-2：撤单必须经实例的 executor 路由（paper→PaperEngine / okx→OMS），禁止直连 OMS
+            ctx = InstanceContext(self, instance_id, rt.get("mode") or self._mode_of(row) or "paper")
+            try:
+                await ctx.oms.cancel_instance_orders(instance_id)
+            except Exception as e:
+                log.warning("撤单失败(实例 %s): %s", instance_id, e)
         if close_position:
             await self.close_instance_position(instance_id)
         db.execute(
@@ -243,7 +255,9 @@ class StrategyManager:
                 "ord_type": "market", "sz_base": open_sz, "reduce_only": True,
                 "instance_id": instance_id, "source": f"strategy:{instance_id}:close",
             }
-            await self.oms.place_intent(intent)
+            ctx = InstanceContext(self, instance_id,
+                                   rt.get("mode") if rt else self._mode_of_row(st or {}) or "paper")
+            await ctx.oms.place_intent(intent)
             self.instance_log(instance_id, f"实例平仓下单 {pos_side} {open_sz}")
             state.update({"pos_side": None, "open_sz": 0.0, "sl_px": None})
             db.execute("UPDATE strategy_instances SET state_json=? WHERE id=?",

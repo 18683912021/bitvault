@@ -5,6 +5,7 @@ import { Switch, Segmented, Space, Tag, Tooltip, App } from 'antd';
 import { ThunderboltOutlined, ExperimentOutlined, FireFilled } from '@ant-design/icons';
 import { useAppStore } from '../store/useAppStore';
 import { getBrainStatus, startAutopilot, stopAutopilot, setVenue as apiSetVenue } from '../api/endpoints';
+import InstrumentSelect from './InstrumentSelect';
 
 export default function HeaderControl() {
   const { message } = App.useApp();
@@ -34,9 +35,10 @@ export default function HeaderControl() {
     setToggling(true);
     try {
       if (checked) {
-        await startAutopilot({ period: '1H' });   // V2 验证最优配置（require_setup+breakout_retest 已是后端默认）
+        // 保留当前配置的决策周期（默认 5m，可在配置接口调整），不再强制 1H
+        const s = await startAutopilot();
         const tag = venue === 'okx' ? '实盘·真实资金' : '模拟·虚拟资金';
-        message.success(`自动驾驶已启动（1H · 纯规则 · ${tag}）`);
+        message.success(`自动驾驶已启动（${s?.config?.period || '5m'} · 纯规则 · ${tag}）`);
       } else {
         await stopAutopilot();
         message.info('自动驾驶已刹车（不开新仓，已有持仓止损止盈仍生效）');
@@ -81,6 +83,11 @@ export default function HeaderControl() {
 
   return (
     <Space size="middle" align="center">
+      {/* 驾驶标的（币种 + 合约/现货）：切换走确认流，切换后自动刹车 */}
+      <Tooltip title="驾驶标的：切换后该标的行情/预测跟随；有持仓时旧仓位继续托管，autopilot 自动刹车需手动开启">
+        <InstrumentSelect switcher />
+      </Tooltip>
+
       {/* 自动驾驶开关（跟随当前模式） */}
       <Tooltip title={apTooltip}>
         <Space size={4} align="center">

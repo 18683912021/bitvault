@@ -6,6 +6,7 @@ import { ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import AutopilotCard from '../components/AutopilotCard';
 import ForecastCard from '../components/ForecastCard';
+import DecisionFeed from '../components/DecisionFeed';
 import { useAppStore } from '../store/useAppStore';
 import { useMarketStore } from '../store/useMarketStore';
 import { useAccountStore } from '../store/useAccountStore';
@@ -17,9 +18,10 @@ import type { PaperAccount } from '../api/types';
 export default function Dashboard() {
   const nav = useNavigate();
   const venue = useAppStore((s) => s.venue);
+  const instId = useAppStore((s) => s.instId);
   const risk = useAppStore((s) => s.risk);
   const notifications = useAppStore((s) => s.notifications);
-  const btcTicker = useMarketStore((s) => s.tickers['BTC-USDT']);
+  const curTicker = useMarketStore((s) => s.tickers[instId]);
   const summary = useAccountStore((s) => s.summary);
   const positions = useAccountStore((s) => s.positions);
   const trades = useOrderStore((s) => s.trades);
@@ -39,18 +41,24 @@ export default function Dashboard() {
   const upl = positions.reduce((a, p) => a + (p.upl || 0), 0);
   const pnlVal = isPaper ? ((paper?.equity ?? 0) - (paper?.initial ?? 0)) : (risk?.daily_pnl_pct ?? 0);
   const posCount = isPaper ? (paper?.positions?.length ?? 0) : positions.length;
-  const btcChg = btcTicker && btcTicker.open24h
-    ? ((btcTicker.last - btcTicker.open24h) / btcTicker.open24h) * 100
+  const curChg = curTicker && curTicker.open24h
+    ? ((curTicker.last - curTicker.open24h) / curTicker.open24h) * 100
     : 0;
+  const base = (instId || 'BTC-USDT').replace(/-SWAP$/, '').split('-')[0];
 
   return (
     <div>
       {/* 自动驾驶状态卡——新手最关心的"它在干嘛" */}
       <AutopilotCard />
 
-      {/* 10 分钟涨跌预测（事件合约参考），10 秒刷新 */}
+      {/* 24 小时涨跌预测，10 秒刷新 */}
       <div style={{ marginTop: 16 }}>
         <ForecastCard />
+      </div>
+
+      {/* 决策记录：让用户随时确认系统在工作 */}
+      <div style={{ marginTop: 16 }}>
+        <DecisionFeed />
       </div>
 
       {risk?.halted && (
@@ -103,12 +111,12 @@ export default function Dashboard() {
         <Col xs={12} md={6}>
           <Card size="small">
             <Statistic
-              title="BTC/USDT"
-              value={btcTicker?.last ?? 0}
+              title={`${base}/USDT`}
+              value={curTicker?.last ?? 0}
               precision={2}
               suffix={
-                <Typography.Text style={{ fontSize: 12, color: pnlColor(btcChg) || '#999' }}>
-                  {fmtPct(btcChg)}
+                <Typography.Text style={{ fontSize: 12, color: pnlColor(curChg) || '#999' }}>
+                  {fmtPct(curChg)}
                 </Typography.Text>
               }
             />

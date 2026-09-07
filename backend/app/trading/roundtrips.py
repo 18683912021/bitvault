@@ -32,15 +32,20 @@ def compute_round_trips(venue: str = "paper", inst_id: str | None = None,
 
     closed 条目：inst_id, side, sz, open_ts, close_ts, open_px, close_px,
                  fee(双边合计), pnl(净收入,已扣双边费), pnl_pct, source, hold_s
+
+    P1-2：配对严格按 inst_id 隔离（不同币种/同币现货与永续永不混配），
+    避免 BTC 开仓被 ETH 平仓错误配对污染连亏统计。
     """
     fills = _load_fills(venue, inst_id)
 
-    long_q: list[dict] = []    # 未平仓多单段
-    short_q: list[dict] = []   # 未平仓空单段
+    long_q: dict[str, list[dict]] = {}     # inst_id → 未平仓多单段（P1-2 按标的隔离）
+    short_q: dict[str, list[dict]] = {}    # inst_id → 未平仓空单段
     closed: list[dict] = []
 
-    def _pair_close(open_queue: list[dict], close_px: float, close_sz: float,
+    def _pair_close(inst: str, open_queues: dict, close_px: float, close_sz: float,
                     close_fee: float, close_ts: int, side_label: str) -> None:
+        """在指定 inst_id 的队列中配对；不同 inst_id 绝不跨队列（P1-2）。"""
+        open_queue = open_queues.get(inst, [])
         remain = close_sz
         close_fee_unit = close_fee / close_sz if close_sz > 0 else 0
         while remain > 1e-12 and open_queue:
@@ -68,32 +73,35 @@ def compute_round_trips(venue: str = "paper", inst_id: str | None = None,
             if seg["sz"] <= 1e-12:
                 open_queue.pop(0)
             remain -= take
+        open_queues[inst] = open_queue
 
     for f in fills:
         px, sz = float(f["px"]), float(f["sz"])
         fee = float(f["fee"] or 0.0)
         pos_side = f.get("pos_side") or "long"
         src = f["source"] or "manual"
+        inst = f["inst_id"]
 
         if pos_side == "short":
             # 空头方向：sell 开空 / buy 平空
             if f["side"] == "sell":
-                short_q.append({"sz": sz, "px": px, "fee": fee, "ts": f["ts"],
-                                "source": src, "inst_id": f["inst_id"]})
+                short_q.setdefault(inst, []).append({"sz": sz, "px": px, "fee": fee, "ts": f["ts"],
+                                                     "source": src, "inst_id": inst})
             else:  # buy 平空
-                _pair_close(short_q, px, sz, fee, f["ts"], "short")
+                _pair_close(inst, short_q, px, sz, fee, f["ts"], "short")
         else:
             # 多头方向：buy 开多 / sell 平多（含现货）
             if f["side"] == "buy":
-                long_q.append({"sz": sz, "px": px, "fee": fee, "ts": f["ts"],
-                               "source": src, "inst_id": f["inst_id"]})
+                long_q.setdefault(inst, []).append({"sz": sz, "px": px, "fee": fee, "ts": f["ts"],
+                                                    "source": src, "inst_id": inst})
             else:  # sell 平多
-                _pair_close(long_q, px, sz, fee, f["ts"], "long")
+                _pair_close(inst, long_q, px, sz, fee, f["ts"], "long")
 
-    open_qty = sum(q["sz"] for q in long_q) + sum(q["sz"] for q in short_q)
+    all_open = [q for qs in long_q.values() for q in qs] + [q for qs in short_q.values() for q in qs]
+    open_qty = sum(q["sz"] for q in all_open)
     open_avg_px = 0.0
     total_sz = 0.0
-    for q in long_q + short_q:
+    for q in all_open:
         open_avg_px += q["sz"] * q["px"]
         total_sz += q["sz"]
     if total_sz > 1e-12:

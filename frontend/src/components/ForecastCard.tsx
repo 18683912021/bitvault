@@ -1,12 +1,13 @@
-// 10 分钟涨跌预测卡（事件合约参考）：后端每 10 秒计算并经 WS 推送，
-// WS 断开时本组件每 10 秒轮询兜底。紧凑展示，不做大篇幅。
+// 未来 24 小时涨跌预测卡（纯规则）：后端每 10 秒计算并经 WS 推送，
+// WS 断开时本组件每 10 秒轮询兜底。精简排版：方向 + 概率 + 建议开平仓价。
 import { useEffect, useState } from 'react';
-import { Card, Col, Row, Tag, Typography, Progress, Tooltip } from 'antd';
+import { Card, Col, Row, Tag, Typography, Progress, Tooltip, Space } from 'antd';
 import { ArrowUpOutlined, ArrowDownOutlined, MinusOutlined, QuestionCircleOutlined } from '@ant-design/icons';
 import { useMarketStore } from '../store/useMarketStore';
 import { useAppStore } from '../store/useAppStore';
-import { getForecast10 } from '../api/endpoints';
-import type { Forecast10 } from '../api/types';
+import { getForecast } from '../api/endpoints';
+import { fmtPx } from '../utils/format';
+import type { Forecast24 } from '../api/types';
 
 const DIR_META: Record<string, { text: string; color: string; icon: JSX.Element }> = {
   up: { text: '看涨', color: '#cf1322', icon: <ArrowUpOutlined /> },      // 红涨绿跌
@@ -20,50 +21,39 @@ const REGIME_LABEL: Record<string, string> = {
   high_vol: '高波动', low_vol: '低波动', extreme: '极端波动', unknown: '状态未知',
 };
 
-// 本地每秒跳动的倒计时（窗口结束）
-function useCountdown(endTs: number) {
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
-  const left = Math.max(0, Math.floor((endTs - now) / 1000));
-  const m = String(Math.floor(left / 60)).padStart(2, '0');
-  const s = String(left % 60).padStart(2, '0');
-  return `${m}:${s}`;
+function fmtWindow(ts: number): string {
+  const d = new Date(ts);
+  return d.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
 export default function ForecastCard() {
   const forecast = useMarketStore((s) => s.forecast);
   const wsConnected = useAppStore((s) => s.wsConnected);
-  const [fallback, setFallback] = useState<Forecast10 | null>(null);
+  const [fallback, setFallback] = useState<Forecast24 | null>(null);
 
   // WS 断线兜底：10 秒轮询
   useEffect(() => {
     if (wsConnected) return;
-    const tick = () => getForecast10().then(setFallback).catch(() => {});
+    const tick = () => getForecast().then(setFallback).catch(() => {});
     tick();
     const t = setInterval(tick, 10000);
     return () => clearInterval(t);
   }, [wsConnected]);
 
-  const f: Forecast10 | null = forecast || fallback;
+  const f: Forecast24 | null = forecast || fallback;
   const meta = DIR_META[f?.direction || 'unknown'] || DIR_META.unknown;
-  const countdown = useCountdown(f?.window_end_ts || 0);
   const pUp = f?.p_up ?? 50;
-  const topFactors = (f?.factors || [])
-    .slice()
-    .sort((a, b) => Math.abs(b.contrib) - Math.abs(a.contrib))
-    .slice(0, 3);
+  const sug = f?.suggestion || null;
+  const isLong = sug?.side === 'long';
 
   return (
     <Card
       size="small"
-      title="未来10分钟涨跌预测"
+      title="未来24小时涨跌预测"
       extra={
-        <Tooltip title="口径对齐 OKX 事件合约：预测下一个 10 分钟窗口结算均价相对基准价的方向。多因子确定性打分（动量/盘口/均值回归/趋势一致性），极端波动时置信度自动折减。仅供事件合约方向参考，不构成承诺。">
+        <Tooltip title="口径：当前时刻 → +24 小时。纯规则多因子（24h动量/1H趋势/4H确认/RSI/布林/量能），极端波动自动折减置信度。建议开仓/止盈/止损价与自动驾驶同一套规则，仅供参考，不构成承诺、不自动下单。">
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            事件合约参考 <QuestionCircleOutlined />
+            确定性评分 <QuestionCircleOutlined />
           </Typography.Text>
         </Tooltip>
       }
@@ -77,16 +67,8 @@ export default function ForecastCard() {
               {meta.icon} {meta.text}
             </div>
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              窗口 {new Date(f.window_start_ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
-              ~{new Date(f.window_end_ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+              {fmtWindow(f.window_start_ts)} ~ {fmtWindow(f.window_end_ts)}
             </Typography.Text>
-          </Col>
-          <Col xs={8} md={5}>
-            <div style={{ fontSize: 12, color: '#999' }}>距窗口结束</div>
-            <div style={{ fontSize: 20, fontVariantNumeric: 'tabular-nums' }}>{countdown}</div>
-            <Tag style={{ marginTop: 2 }} color={REGIME_LABEL[f.regime] ? 'default' : 'default'}>
-              {REGIME_LABEL[f.regime] || f.regime}
-            </Tag>
           </Col>
           <Col xs={8} md={4}>
             <div style={{ fontSize: 12, color: '#999' }}>看涨概率</div>
@@ -102,26 +84,51 @@ export default function ForecastCard() {
               style={{ maxWidth: 90 }}
             />
           </Col>
-          <Col xs={24} md={10}>
-            {topFactors.map((x) => (
-              <div key={x.key} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, lineHeight: '20px' }}>
-                <Typography.Text type="secondary">{x.label}</Typography.Text>
-                <span>
-                  <Typography.Text style={{ fontSize: 12 }}>{x.value_text}</Typography.Text>
-                  <span style={{ marginLeft: 6, color: x.contrib > 0.01 ? '#cf1322' : x.contrib < -0.01 ? '#3f8600' : '#999' }}>
-                    {x.contrib > 0.01 ? '↑' : x.contrib < -0.01 ? '↓' : '—'}
-                  </span>
-                </span>
-              </div>
-            ))}
+          <Col xs={8} md={3}>
+            <div style={{ fontSize: 12, color: '#999' }}>参考价</div>
+            <div style={{ fontSize: 16, fontWeight: 600 }}>{fmtPx(f.ref_price)}</div>
+            <Tag style={{ marginTop: 2 }}>{REGIME_LABEL[f.regime] || f.regime}</Tag>
+          </Col>
+          <Col xs={24} md={12}>
+            {sug ? (
+              isLong ? (
+                <Space>
+                  <Tag color="red">建议开多</Tag>
+                  <PriceTag label="开仓" v={sug.entry_px} />
+                  <PriceTag label="止盈" v={sug.tp1_px} />
+                  <PriceTag label="止损" v={sug.sl_px} />
+                  {sug.tp2_px ? <Typography.Text type="secondary" style={{ fontSize: 12 }}>2R {fmtPx(sug.tp2_px)} · R:{sug.rr?.toFixed(1)}</Typography.Text> : null}
+                </Space>
+              ) : (
+                <Space>
+                  <Tag color="green">建议开空</Tag>
+                  <PriceTag label="开仓" v={sug.entry_px} />
+                  <PriceTag label="止盈" v={sug.tp1_px} />
+                  <PriceTag label="止损" v={sug.sl_px} />
+                  {sug.tp2_px ? <Typography.Text type="secondary" style={{ fontSize: 12 }}>2R {fmtPx(sug.tp2_px)} · R:{sug.rr?.toFixed(1)}</Typography.Text> : null}
+                </Space>
+              )
+            ) : (
+              <Typography.Text type="secondary">{sug === null ? '建议观望' : ''}</Typography.Text>
+            )}
           </Col>
         </Row>
       )}
-      {f?.note && (
+      {f?.note ? (
         <Typography.Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 8 }}>
           {f.note}
         </Typography.Text>
-      )}
+      ) : null}
     </Card>
+  );
+}
+
+function PriceTag({ label, v }: { label: string; v?: number }) {
+  if (v == null) return null;
+  return (
+    <span style={{ display: 'inline-flex', flexDirection: 'column', lineHeight: '16px', marginRight: 8 }}>
+      <Typography.Text type="secondary" style={{ fontSize: 11 }}>{label}</Typography.Text>
+      <span style={{ fontWeight: 600, fontSize: 14 }}>{fmtPx(v)}</span>
+    </span>
   );
 }

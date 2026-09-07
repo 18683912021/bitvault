@@ -23,6 +23,57 @@ def svc(request: Request):
     return request.app.state.svc
 
 
+# ================= 健康 =================
+@router.get("/health")
+async def health(request: Request):
+    """P2-8：健康检查（公开只读）。含数据库/行情/WS/执行器/自动驾驶/风控/策略健康。"""
+    s = svc(request)
+    from app.brain.health import health_status
+    brain = s.brain
+    reg = brain.last_factors.get("regime") if brain and brain.last_factors else None
+    if brain and reg is None:
+        try:
+            from app.brain.factor_engine import compute_factors
+            c = brain._recent_candles(brain.config().get("period", "5m"))
+            if len(c) >= 30:
+                f = compute_factors(c)
+                reg = f.get("regime") if not f.get("error") else None
+        except Exception:
+            reg = None
+    last_dec = None
+    try:
+        r = db.query_one("SELECT ts FROM signals WHERE instance_id=0 ORDER BY ts DESC LIMIT 1")
+        last_dec = r["ts"] if r else None
+    except Exception:
+        pass
+    last_order = None
+    try:
+        r = db.query_one("SELECT MAX(created_at) ts FROM orders")
+        last_order = r["ts"] if r else None
+    except Exception:
+        pass
+    pws = s.private_ws.status if s.private_ws else "no_key"
+    return {
+        "application": "bitvault",
+        "database": "ok" if s.data.status is not None else "unknown",
+        "market_data": s.data.status,
+        "public_ws": s.public_ws.status if s.public_ws else "disconnected",
+        "business_ws": s.business_ws.status if s.business_ws else "disconnected",
+        "private_ws": pws,
+        "oms": bool(s.oms),
+        "paper_engine": bool(s.paper),
+        "autopilot": bool(brain),
+        "current_inst": s.inst_id,
+        "current_period": brain.config().get("period") if brain else None,
+        "current_regime": reg,
+        "last_decision_at": last_dec,
+        "last_order_at": last_order,
+        "last_error": "",
+        "risk": s.risk.status(),
+        "strategy_health": health_status(s.venue),
+    }
+
+
 # ================= 系统 =================
 @router.get("/status")
 async def status(request: Request):
@@ -31,6 +82,7 @@ async def status(request: Request):
         "env": s.env,
         "has_key": s.has_key(),
         "venue": s.venue,
+        "inst_id": s.inst_id,
         "time_offset_ms": round(s.public_client._time_offset_ms) if s.public_client else 0,
         "market": s.data.status if s.data else {},
         "private_ws": s.private_ws.status if s.private_ws else "no_key",
@@ -38,12 +90,34 @@ async def status(request: Request):
         "business_ws": s.business_ws.status if s.business_ws else "disconnected",
         "risk": s.risk.status(),
         "account_config": s.account.account_config if s.account else {},
-        "whitelist": config.INSTRUMENT_WHITELIST,
+        "whitelist": sorted(config.InstrumentRegistry.supported),
         "strategy_types": [
             {"type": t, "label": c.label, "params_schema": c.params_schema}
             for t, c in s.strategy_registry().items()
         ],
     }
+
+
+# ================= 系统级标的（驾驶标的） =================
+@router.get("/instrument")
+async def get_instrument(request: Request):
+    s = svc(request)
+    return {"inst_id": s.inst_id}
+
+
+@router.post("/instrument")
+async def set_instrument_route(request: Request, body: dict):
+    """切换驾驶标的（币种+合约/现货）。
+    安全语义：旧标的存在仓继续托管（止盈止损生效）；切换后 autopilot 自动刹车，需人工开启。"""
+    s = svc(request)
+    want = (body or {}).get("inst_id", "")
+    if not want or not s.data.is_supported(want):
+        raise HTTPException(400, f"标的 {want} 不在已同步的 OKX 支持集内（暂不支持）")
+    prev = s.inst_id
+    actual = s.set_instrument(want)
+    if not actual:
+        raise HTTPException(400, f"标的 {want} 切换失败")
+    return {"ok": True, "inst_id": actual, "prev_inst_id": prev, "braked": True}
 
 
 # ================= 系统级模式（venue） =================
@@ -111,12 +185,15 @@ async def activate_key(kid: int, request: Request):
 
 @router.delete("/keys/{kid}")
 async def delete_key(kid: int, request: Request):
-    row = db.query_one("SELECT env FROM api_keys WHERE id=?", (kid,))
+    row = db.query_one("SELECT env, is_active FROM api_keys WHERE id=?", (kid,))
     if not row:
         raise HTTPException(404, "Key 不存在")
+    was_active = bool(row.get("is_active"))
     db.execute("DELETE FROM api_keys WHERE id=?", (kid,))
-    if row["is_active"] if "is_active" in row else False:
+    # F13 修复：删除当前激活 Key 必须断连（否则实盘连接残留，风控/账户仍指向旧 Key）
+    if was_active:
         await svc(request).disconnect_private()
+        svc(request).add_audit("user", "delete_key", {"id": kid}, "active_key_disconnected")
     return {"ok": True}
 
 
@@ -145,7 +222,17 @@ async def ticker(request: Request, instId: str):
 
 @router.get("/market/instruments")
 async def instruments(request: Request):
-    return list(svc(request).data.instruments.values())
+    """支持集：OKX 同步的 USDT 现货+永续（供选标器；现货在前，按 币种 排序）。"""
+    s = svc(request)
+    insts = list(s.data.instruments.values())
+    vols = getattr(s.data, "vol24h", {})
+    # 现货组在前；组内按 24h 成交额（总值指标）降序，无数据排最后
+    insts.sort(key=lambda i: (
+        (i.get("instType") != "SPOT"),
+        -(vols.get(i["instId"], 0) or 0),
+        i.get("baseCcy") or i["instId"],
+    ))
+    return [{**i, "vol24h": vols.get(i["instId"], 0)} for i in insts]
 
 
 @router.get("/market/candles")
@@ -201,12 +288,22 @@ async def funding_rate(request: Request, instId: str = "BTC-USDT-SWAP"):
         raise HTTPException(502, str(e))
 
 
-@router.get("/market/forecast10")
-async def forecast10(request: Request, instId: str = "BTC-USDT"):
-    """10 分钟涨跌预测（事件合约参考），10 秒缓存，确定性多因子打分。"""
-    from app.brain import forecast10
+@router.get("/market/forecast")
+async def forecast(request: Request, instId: str = ""):
+    """未来 24 小时涨跌预测（当前驾驶标的），10 秒刷新，确定性多因子打分 + 建议开平仓价。"""
+    from app.brain import forecast24
 
-    return forecast10.compute(svc(request).data, instId)
+    s = svc(request)
+    return forecast24.compute(s.data, instId or s.inst_id)
+
+
+@router.get("/market/forecast10")
+async def forecast_alias(request: Request, instId: str = ""):
+    """兼容别名：指向 24 小时预测（原 10 分钟口径已下线）。"""
+    from app.brain import forecast24
+
+    s = svc(request)
+    return forecast24.compute(s.data, instId or s.inst_id)
 
 
 # ================= 账户 =================
@@ -292,17 +389,21 @@ async def brain_update_config(request: Request, body: dict):
         raise HTTPException(400, "决策大脑未就绪")
     old_cfg = s.brain.config()
     new_cfg = {**old_cfg}
+    sm = new_cfg.get("strategy_mode")
+    if sm not in (None, "official", "research_pullback"):
+        raise HTTPException(400, "strategy_mode 仅支持 official / research_pullback")
     allowed = {"mode", "leverage", "period", "max_order_usdt", "require_setup",
                "setup_filter", "cooldown_min", "max_opens_per_day",
-               "loss_pause_n", "loss_pause_min", "daily_loss_limit_usdt"}
+               "loss_pause_n", "loss_pause_min", "daily_loss_limit_usdt",
+               "strategy_mode"}
     for k in allowed:
         if k in body:
             new_cfg[k] = body[k]
     lev = int(new_cfg.get("leverage", 2) or 2)
     if lev < 1:
         lev = 1
-    elif lev > config.LEVERAGE_CAP:
-        lev = config.LEVERAGE_CAP
+    elif lev > s.risk.lever_cap:
+        lev = s.risk.lever_cap   # 服从风控中心设置的杠杆上限（页面可配、热生效）
     new_cfg["leverage"] = lev
     db.set_setting(f"autopilot_config_{s.venue}", new_cfg)
     return {"ok": True, "config": new_cfg, "venue": s.venue}

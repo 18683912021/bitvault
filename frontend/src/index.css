@@ -45,3 +45,17 @@
   border-radius: 6px !important;
   font-size: 13px !important;
 }
+
+/* ---------- Tailwind v4（移动端 H5 手写样式） ----------
+   全量引入（含按需扫描与任意值类）。preflight 会被 antd 组件自身样式与
+   antd/dist/reset.css 覆盖，PC 端不受影响；H5 原始元素由类名自行控制。 */
+@import "tailwindcss";
+
+/* 移动端细节：隐藏横滑滚动条 + 弹层滑入动画 */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { scrollbar-width: none; }
+@keyframes msheet { from { transform: translateY(24px); opacity: 0.6; } to { transform: translateY(0); opacity: 1; } }
+@keyframes breath {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}

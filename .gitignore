@@ -31,3 +31,8 @@ stdout.log
 # OS
 .DS_Store
 Thumbs.db
+
+# 本地会话/计划数据（不入库）
+.zcode/
+# 前端构建期令牌（私人注入模式，不入库）
+frontend/.env.production

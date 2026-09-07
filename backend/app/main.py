@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from app import config, db
 from app.account.account_service import AccountService
 from app.api import routes, ws as ws_routes
+from app.api.auth import auth_middleware
 from app.brain.autopilot import Autopilot
 from app.core import event_bus, security
 from app.exchange.okx_client import OkxClient
@@ -47,6 +48,9 @@ class Services:
         # 系统级模式（venue）：'paper' 模拟虚拟资金 / 'okx' 实盘真实资金。
         # autopilot 跟随此模式执行；持久化在 settings，启动恢复上次模式。
         self.venue: str = "paper"
+        # 当前驾驶标的（币种+合约/现货=一个 inst_id）：切换时重订阅行情 + autopilot 刹车。
+        # 持久化在 settings，启动恢复上次标的。
+        self.inst_id: str = config.DEFAULT_INST_ID
         # 私有连接部分
         self.env = "none"
         self.private_client: OkxClient | None = None
@@ -71,6 +75,28 @@ class Services:
         event_bus.publish("venue", {"venue": venue})
         return venue
 
+    def set_instrument(self, inst_id: str) -> str | None:
+        """切换驾驶标的（币种/合约现货）。校验支持集；切换后 autopilot 自动刹车，
+        旧标的已管理仓位继续保持止损止盈托管。返回实际生效的 inst_id（无效返回 None）。"""
+        if not inst_id or not self.data.is_supported(inst_id):
+            log.warning("标的 %s 不在支持集内，切换被拒", inst_id)
+            return None
+        if inst_id == self.inst_id:
+            return self.inst_id
+        prev = self.inst_id
+        self.inst_id = inst_id
+        db.set_setting("system_inst_id", inst_id)
+        log.info("驾驶标的切换：%s → %s", prev, inst_id)
+        event_bus.publish("inst", {"inst_id": inst_id, "prev": prev})
+        if self.brain:
+            self.brain.on_instrument_switch(prev)
+        # 行情重订阅 + 预热 K 线（失败不影响切换结果，兜底循环会补齐）
+        try:
+            asyncio.ensure_future(self.data.set_active_inst(inst_id))
+        except Exception as e:
+            log.warning("切换行情频道失败: %s", e)
+        return inst_id
+
     def strategy_registry(self):
         from app.strategy.templates import STRATEGY_REGISTRY
 
@@ -83,6 +109,12 @@ class Services:
         except Exception as e:
             log.warning("初始时间同步失败(OKX不可达): %s", e)
         await self.data.load_instruments()
+        await self.data.start_instrument_refresh()   # 每 10 分钟重试同步（OKX 恢复/新币自动补齐）
+        # 恢复上次驾驶标的（无效则回落默认；频道按此构建）
+        saved_inst = db.get_setting("system_inst_id") or config.DEFAULT_INST_ID
+        if isinstance(saved_inst, str) and self.data.is_supported(saved_inst):
+            self.inst_id = saved_inst
+        self.data.active_inst = self.inst_id
         # 公共端点：tickers / books5 / trades
         self.public_ws = OkxWebSocket(
             config.OKX_WS_PUBLIC,
@@ -142,13 +174,13 @@ class Services:
                 log.warning("时间同步失败: %s", e)
 
     async def _forecast_loop(self) -> None:
-        from app.brain import forecast10
+        from app.brain import forecast24
 
         n = 0
         while True:
             t0 = asyncio.get_event_loop().time()
             try:
-                result = forecast10.compute(self.data, "BTC-USDT")
+                result = forecast24.compute(self.data, self.inst_id)
                 if result.get("direction") != "unknown" or result.get("ref_price"):
                     event_bus.publish("forecast", result)
                     n += 1
@@ -208,6 +240,9 @@ class Services:
         oms = OMS(client, account, self.risk, self.data, env)
         self.oms = oms
         self.risk.env = env
+        # P0-4：账户接入风控（max_position_pct / 自动熔断 / reduce_hint 生效链路）
+        self.risk.account = account
+        account.on_refresh = lambda summary: self.risk.on_account({"summary": summary})
         await oms.start()
         await account.start()
 
@@ -215,6 +250,7 @@ class Services:
             config.OKX_WS_PRIVATE_DEMO if env == "demo" else config.OKX_WS_PRIVATE,
             client=client,
             on_message=self._on_private_message,
+            on_status=self._on_private_status,
             name=f"private-{env}",
         )
         self.private_ws.set_channels([
@@ -229,6 +265,12 @@ class Services:
             self.manager.account = account
         log.info("私有连接建立 env=%s key=%s", env, key_row["key_masked"])
         event_bus.publish("risk", {"event": "connection", "env": env})
+
+    def _on_private_status(self, status: str) -> None:
+        """P1-6：私有连接恢复后主动重同步（余额/持仓/活跃挂单），尽快修复本地态。"""
+        if status == "connected" and self.oms:
+            asyncio.ensure_future(self.oms.sync_all())
+            log.info("私有 WS 恢复（%s），已触发主动重同步", self.env)
 
     async def _on_private_message(self, msg: dict) -> None:
         arg = msg.get("arg") or {}
@@ -277,6 +319,13 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title="BitVault", lifespan=_lifespan)
+
+# P0-1：全站 API 鉴权（Bearer Token + 高风险 confirm）；公开只读名单在 app/api/auth.py
+app.middleware("http")(auth_middleware)
+
+if not config.API_TOKEN:
+    log.warning("未配置 BV_API_TOKEN：交易/敏感 API 全部禁用（fail-closed），仅公开只读接口可用。"
+                "生产部署请设置环境变量。")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )

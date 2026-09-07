@@ -8,6 +8,8 @@ import {
 } from '@ant-design/icons';
 import KillSwitch from '../components/KillSwitch';
 import HeaderControl from '../components/HeaderControl';
+import { useIsMobile } from '../useIsMobile';
+import MobileLayout from '../mobile/MobileLayout';
 import { useAppStore } from '../store/useAppStore';
 import { useBitVaultWS } from '../ws/useBitVaultWS';
 import { getStatus, getNotifications } from '../api/endpoints';
@@ -33,10 +35,14 @@ export default function MainLayout() {
   const setHasKey = useAppStore((s) => s.setHasKey);
   const setRisk = useAppStore((s) => s.setRisk);
   const setVenue = useAppStore((s) => s.setVenue);
+  const setInstId = useAppStore((s) => s.setInstId);
   const setNotifications = useAppStore((s) => s.setNotifications);
+  const isMobile = useIsMobile();
   useBitVaultWS();
 
   // 初始拉一次状态 + 通知（WS 连接后会增量更新）
+  // 注意：必须放在移动端分支之前执行——H5 依赖这里同步 hasKey/venue/inst_id，
+  // 否则手机上"实盘"永远未连接而无法切换。
   useEffect(() => {
     const poll = async () => {
       try {
@@ -45,6 +51,7 @@ export default function MainLayout() {
         setHasKey(st.has_key);
         setRisk(st.risk);
         if (st.venue) setVenue(st.venue);   // 同步后端系统级模式（paper/okx）
+        if (st.inst_id) setInstId(st.inst_id);   // 同步驾驶标的（币种+合约/现货）
       } catch { /* ignore */ }
       try {
         const ns = await getNotifications(50);
@@ -54,7 +61,12 @@ export default function MainLayout() {
     poll();
     const t = setInterval(poll, 10000);
     return () => clearInterval(t);
-  }, [setEnv, setHasKey, setRisk, setVenue, setNotifications]);
+  }, [setEnv, setHasKey, setRisk, setVenue, setInstId, setNotifications]);
+
+  // 移动端（H5）：独立信息架构与交互层（顶部驾驶条 + 底部 TabBar），PC 布局不受影响。
+  if (isMobile) {
+    return <MobileLayout />;
+  }
 
   // 顶部保持中性简洁：自动驾驶跟随系统级模式（顶栏 Switch + 彩色徽章 + 模式切换）
 

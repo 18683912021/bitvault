@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Ticker, Book5, Trade, Candle, Forecast10 } from '../api/types';
+import type { Ticker, Book5, Trade, Candle, Forecast24 } from '../api/types';
 
 interface MarketState {
   instId: string;
@@ -8,8 +8,8 @@ interface MarketState {
   depth: Record<string, Book5>;
   trades: Record<string, Trade[]>;
   candles: Record<string, Candle[]>; // key: `${instId}:${period}`
-  forecast: Forecast10 | null;
-  setForecast: (f: Forecast10) => void;
+  forecast: Forecast24 | null;
+  setForecast: (f: Forecast24) => void;
   setInstId: (id: string) => void;
   setPeriod: (p: string) => void;
   setTickers: (t: Record<string, Ticker>) => void;

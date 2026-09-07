@@ -20,6 +20,8 @@ class AccountService:
         self.account_config: dict = {}
         self._snap_ts = 0
         self._task: asyncio.Task | None = None
+        # P0-4：账户刷新成功后的风控回调（main 注入 → risk.on_account）
+        self.on_refresh = None
 
     async def start(self) -> None:
         await self.refresh_config()
@@ -105,16 +107,31 @@ class AccountService:
             self.positions = []
         payload = {"summary": self.summary, "positions": self.positions}
         event_bus.publish("account", payload)
+        if self.on_refresh:
+            try:
+                self.on_refresh(self.summary)
+            except Exception as e:
+                log.debug("on_refresh 回调异常: %s", e)
 
         # 每 5 分钟快照一次资金曲线
         now = time.time()
         if now - self._snap_ts > 300:
             self._snap_ts = now
             try:
+                # P2-2：实写可用资金/占用保证金/未实现盈亏（原先恒为 0 属虚假数据）
+                avail = 0.0
+                for d in self.summary.get("details") or []:
+                    avail += float(d.get("availBal") or d.get("cashBal") or 0)
+                margin_used = 0.0
+                upl = 0.0
+                for p in self.positions:
+                    margin_used += float(p.get("imr") or p.get("margin") or 0)
+                    upl += float(p.get("upl") or p.get("upl_px") or 0)
                 db.execute(
                     "INSERT OR REPLACE INTO account_snapshots (ts, equity, available, margin_used, unrealized_pnl, env)"
                     " VALUES (?,?,?,?,?,?)",
-                    (int(now * 1000), self.summary["totalEq"], 0, 0, 0, self.env),
+                    (int(now * 1000), self.summary["totalEq"], round(avail, 4),
+                     round(margin_used, 4), round(upl, 4), self.env),
                 )
             except Exception:
                 pass

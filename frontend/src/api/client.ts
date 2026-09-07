@@ -3,6 +3,32 @@ import { message } from 'antd';
 // 统一 fetch 封装：base = /api，错误 → antd message.error，含中文释义。
 // 注：使用静态 message API（antD 5）。main.tsx 已用 App 包裹，但 client 在 React 树外，
 // 此处仅用于错误提示，主题差异可忽略。
+const TOKEN_KEY = 'bv_api_token';
+
+declare global {
+  interface Window { __BV_TOKEN__?: string }
+}
+
+// 构建期注入（VITE_BV_API_TOKEN，前端注入模式）：打开网页自动携带，零手动配置。
+// 手动粘贴（Settings 页，localStorage）仍作为覆盖项。
+const BUILTIN_TOKEN =
+  (typeof import.meta !== 'undefined' && (import.meta.env?.VITE_BV_API_TOKEN as string | undefined)) ||
+  (typeof window !== 'undefined' ? window.__BV_TOKEN__ || '' : '') ||
+  '';
+
+/** P0-1 鉴权：令牌来源 = 构建内置 > 手动配置(localStorage)。未配置时后端 fail-closed 401。 */
+export function getApiToken(): string {
+  return BUILTIN_TOKEN || localStorage.getItem(TOKEN_KEY) || '';
+}
+export function tokenSource(): 'builtin' | 'manual' | 'none' {
+  if (BUILTIN_TOKEN) return 'builtin';
+  return localStorage.getItem(TOKEN_KEY) ? 'manual' : 'none';
+}
+export function setApiToken(t: string) {
+  if (t) localStorage.setItem(TOKEN_KEY, t.trim());
+  else localStorage.removeItem(TOKEN_KEY);
+}
+
 export function setAntdApp(_app: unknown) {
   /* 保留入口，静态 message 无需注入 */
 }
@@ -49,9 +75,16 @@ async function request<T>(method: string, path: string, opts?: {
     }
     url += '?' + usp.toString();
   }
-  const init: RequestInit = { method, headers: {} };
-  if (body !== undefined) {
-    init.headers = { 'Content-Type': 'application/json' };
+  const init: RequestInit = { method, headers: {} as Record<string, string> };
+  // P0-1：统一携带 Bearer Token（未配置由后端 401 提示）
+  const token = getApiToken();
+  if (token) (init.headers as Record<string, string>)['Authorization'] = 'Bearer ' + token;
+  // 高风险写操作需要 confirm=true（后端 middleware 校验；前端已有人工确认弹窗）
+  if (method !== 'GET' && body !== undefined && typeof body === 'object' && !Array.isArray(body)) {
+    init.headers = { 'Content-Type': 'application/json', ...init.headers };
+    init.body = JSON.stringify({ confirm: true, ...body });
+  } else if (body !== undefined) {
+    init.headers = { 'Content-Type': 'application/json', ...init.headers };
     init.body = JSON.stringify(body);
   }
   try {
@@ -89,6 +122,8 @@ async function request<T>(method: string, path: string, opts?: {
 export const api = {
   get: <T>(path: string, query?: Record<string, any>) =>
     request<T>('GET', path, { query }),
-  post: <T>(path: string, body?: any) => request<T>('POST', path, { body }),
-  del: <T>(path: string) => request<T>('DELETE', path),
+  post: <T>(path: string, body?: any, query?: Record<string, any>) =>
+    request<T>('POST', path, { body, query }),
+  del: <T>(path: string, query?: Record<string, any>) =>
+    request<T>('DELETE', path, { query }),
 };

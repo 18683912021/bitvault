@@ -20,9 +20,21 @@ export interface PaperAccount {
 }
 
 // ---------- 决策大脑 ----------
+export interface ManagedPos {
+  inst_id: string;
+  side: string;
+  sz?: number;
+  entry_px?: number;
+  sl_px?: number;
+  tp1_px?: number;
+  open_ts?: number;
+  setup?: string;
+}
+
 export interface BrainStatus {
   enabled: boolean;
   running: boolean;
+  inst_id: string;
   period: string;
   engine?: string;
   venue: 'paper' | 'okx';
@@ -31,6 +43,7 @@ export interface BrainStatus {
   last_decision: BrainDecision | null;
   last_error: string;
   position: any;
+  positions?: ManagedPos[];
   regime?: string;
   regime_reason?: string;
   throttle?: {
@@ -46,6 +59,7 @@ export interface BrainStatus {
   };
   mode?: 'normal' | 'sprint';
   leverage?: number;
+  leverage_cap?: number;
 }
 
 export interface BrainDecision {
@@ -88,6 +102,8 @@ export interface StrategyTemplate {
 export interface Instrument {
   instId: string;
   instType: 'SPOT' | 'SWAP';
+  quoteCcy?: string;
+  baseCcy?: string;
   lotSz: number;
   minSz: number;
   tickSz: number;
@@ -355,6 +371,7 @@ export interface SystemStatus {
   env: Env;
   has_key: boolean;
   venue: 'paper' | 'okx';
+  inst_id: string;
   time_offset_ms: number;
   market?: Record<string, string>;
   private_ws: string;
@@ -383,7 +400,7 @@ export interface WsMessage {
   ts?: number;
 }
 
-// 10 分钟涨跌预测（事件合约参考）
+// 未来 24 小时涨跌预测（纯规则，含建议开平仓价）
 export interface ForecastFactor {
   key: string;
   label: string;
@@ -393,9 +410,22 @@ export interface ForecastFactor {
   contrib: number;
 }
 
-export interface Forecast10 {
+export interface ForecastSuggestion {
+  side: 'long' | 'short' | 'flat';
+  entry_px?: number;
+  sl_px?: number;
+  tp1_px?: number;
+  tp2_px?: number;
+  tp_px?: number;
+  rr?: number;
+  sl_basis?: string;
+  note?: string;
+}
+
+export interface Forecast24 {
   inst_id: string;
   ts: number;
+  horizon: '24h';
   direction: 'up' | 'down' | 'flat' | 'unknown';
   p_up: number;
   score: number;
@@ -406,5 +436,6 @@ export interface Forecast10 {
   window_end_ts: number;
   ref_price: number;
   factors: ForecastFactor[];
+  suggestion: ForecastSuggestion | null;
   note: string;
 }

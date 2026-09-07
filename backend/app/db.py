@@ -100,6 +100,17 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER NOT NULL, actor TEXT, action TEXT, payload_json TEXT, result TEXT
 );
+CREATE TABLE IF NOT EXISTS trade_journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER, venue TEXT, inst_id TEXT, side TEXT,
+    entry_px REAL, exit_px REAL, sz REAL,
+    sl_px REAL, tp1_px REAL, tp2_px REAL,
+    mfe_px REAL, mae_px REAL, mfe_r REAL, mae_r REAL,
+    pnl REAL, fees REAL, leverage INTEGER, risk_tier TEXT,
+    regime TEXT, setup TEXT, score REAL, htf_4h TEXT, htf_1h TEXT,
+    exit_reason TEXT, hold_bars INTEGER, open_ts INTEGER,
+    strategy_mode TEXT, guards_json TEXT
+);
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER NOT NULL, level TEXT, title TEXT, body TEXT, read INTEGER DEFAULT 0
@@ -133,6 +144,15 @@ def _migrate() -> None:
         _conn.execute("ALTER TABLE orders ADD COLUMN venue TEXT DEFAULT 'okx'")
     if "leverage" not in cols:
         _conn.execute("ALTER TABLE orders ADD COLUMN leverage INTEGER DEFAULT 1")
+    if "reduce_only" not in cols:
+        # P0-5：纸面/实盘订单的减仓标志必须持久化，防止 reduce-only 单被误当反向开仓
+        _conn.execute("ALTER TABLE orders ADD COLUMN reduce_only INTEGER NOT NULL DEFAULT 0")
+    jcols = {r[1] for r in _conn.execute("PRAGMA table_info(trade_journal)").fetchall()} if _conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='trade_journal'").fetchone() else set()
+    if jcols and "strategy_mode" not in jcols:
+        _conn.execute("ALTER TABLE trade_journal ADD COLUMN strategy_mode TEXT")
+    if jcols and "guards_json" not in jcols:
+        _conn.execute("ALTER TABLE trade_journal ADD COLUMN guards_json TEXT")
 
     row = _conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='strategy_instances'"
@@ -186,8 +206,12 @@ def _seed_defaults() -> None:
     # autopilot 默认配置（llm_config 由 main.py 启动时加密写入，避免 db→security 循环依赖）
     _conn.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('autopilot_config', ?)",
-        (json.dumps({"enabled": False, "period": "1m", "min_confidence": 0.6,
-                     "max_position_pct": 10, "max_order_usdt": 200}),),
+        # 与 Autopilot.config() 默认值对齐（P1-7）；min_confidence/max_position_pct 为历史僵尸键已移除
+        (json.dumps({"enabled": False, "period": "5m", "max_order_usdt": 200,
+                     "cooldown_min": 15, "max_opens_per_day": 20,
+                     "loss_pause_n": 3, "loss_pause_min": 60,
+                     "daily_loss_limit_usdt": 100, "require_setup": True,
+                     "setup_filter": "breakout_retest", "mode": "normal", "leverage": 2}),),
     )
     _conn.commit()
 

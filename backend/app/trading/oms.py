@@ -44,6 +44,8 @@ class OMS:
 
     # ================= 下单（唯一管道） =================
     async def place_intent(self, intent: dict) -> dict:
+        from app.core.trade_intent import validate_intent
+        validate_intent(intent)   # 统一 TradeIntent 契约（P2-4：缺失/非法字段 fail-closed）
         """
         intent: inst_id, side(buy/sell), ord_type(market/limit/post_only), px,
                 sz_base(BTC 数量，SWAP 自动转张), reduce_only, instance_id,
@@ -79,7 +81,10 @@ class OMS:
         if err:
             raise RiskBlocked(err)
 
-        notional = px * sz_base
+        try:
+            notional = self.data.calculate_notional(inst_id, sz_base, px)
+        except ValueError as e:
+            raise RiskBlocked(str(e))
         # 红线 R4：风控检查 + 下单必须原子化（并发锁防止多单同时绕过仓位/风控限制）
         async with self._place_lock:
             self.risk.check_pretrade(
@@ -91,10 +96,22 @@ class OMS:
             # tdMode / posSide 由账户配置决定
             is_swap = ins["instType"] == "SWAP"
             acct_lv = str(self.account.account_config.get("acctLv") or "")
-            if is_swap and acct_lv == "1":
-                raise RiskBlocked("当前 OKX 账户为现货模式，无法交易合约，请在 OKX 端切换账户模式")
+            # P1-5 fail-closed：无法确认账户模式（配置获取失败）时禁止 SWAP 新开仓
+            if is_swap and not reduce_only:
+                if acct_lv in ("", "1"):
+                    raise RiskBlocked(
+                        "无法确认 OKX 账户模式（acctLv 缺失或为现货模式），禁止合约开仓。"
+                        "请在 OKX 端确认账户模式后重试。")
             td_mode = "cash" if not is_swap else (intent.get("td_mode") or "isolated")
             pos_side = self.account.pos_side_for(side, reduce_only) if is_swap else None
+
+            # P0-3：开仓前把杠杆真正写入交易所；失败=禁止开仓（fail-closed，绝不按错误杠杆下单）
+            if is_swap and not reduce_only and leverage > 1:
+                mgn_mode = "cross" if td_mode in ("cross", "cross_margin") else "isolated"
+                try:
+                    await self.client.set_leverage(inst_id, str(leverage), mgn_mode)
+                except Exception as e:
+                    raise RiskBlocked(f"设置 OKX 杠杆 {leverage}x 失败（{mgn_mode}）：{e}；禁止开仓")
 
             body: dict = {
                 "instId": inst_id,
@@ -128,13 +145,14 @@ class OMS:
                 "pos_side": pos_side or "", "ord_type": send_ord_type,
                 "px": px, "sz": sz_base, "state": "pending_submit",
                 "source": source, "sl_trigger_px": float(intent["sl_trigger_px"]) if intent.get("sl_trigger_px") else None,
+                "reduce_only": 1 if reduce_only else 0,
                 "created_at": now, "updated_at": now,
             }
             order_id = db.execute(
                 "INSERT INTO orders (cl_ord_id, instance_id, inst_id, td_mode, side, pos_side, ord_type,"
-                " px, sz, state, source, venue, sl_trigger_px, created_at, updated_at)"
+                " px, sz, state, source, venue, sl_trigger_px, reduce_only, created_at, updated_at)"
                 " VALUES (:cl_ord_id,:instance_id,:inst_id,:td_mode,:side,:pos_side,:ord_type,"
-                " :px,:sz,:state,:source,'okx',:sl_trigger_px,:created_at,:updated_at)",
+                " :px,:sz,:state,:source,'okx',:sl_trigger_px,:reduce_only,:created_at,:updated_at)",
                 order_row,
             )
 
@@ -213,8 +231,7 @@ class OMS:
                      float(r["fillPx"]), fill_sz, float(r.get("fillFee") or 0),
                      row["instance_id"], int(r.get("uTime") or time.time() * 1000)),
                 )
-            row = self._publish_order(row["id"])
-            event_bus.publish("order", row)
+            row = self._publish_order(row["id"])   # P2-1：内部已 publish，不再重复发
             if row["instance_id"]:
                 event_bus.publish("instance_order", row)
 
@@ -244,8 +261,9 @@ class OMS:
         return {"ok": True, "state": "canceled"}
 
     async def cancel_instance_orders(self, instance_id: int) -> int:
+        # P1-3：严格限定 venue='okx'，绝不撤 paper 挂单
         rows = db.query(
-            f"SELECT * FROM orders WHERE instance_id=? AND state IN ({','.join('?' * len(OPEN_STATES))})",
+            f"SELECT * FROM orders WHERE venue='okx' AND instance_id=? AND state IN ({','.join('?' * len(OPEN_STATES))})",
             (instance_id, *OPEN_STATES),
         )
         n = 0
@@ -258,8 +276,9 @@ class OMS:
         return n
 
     async def cancel_all_orders(self) -> int:
+        # P1-3：严格限定 venue='okx'
         rows = db.query(
-            f"SELECT * FROM orders WHERE state IN ({','.join('?' * len(OPEN_STATES))})",
+            f"SELECT * FROM orders WHERE venue='okx' AND state IN ({','.join('?' * len(OPEN_STATES))})",
             tuple(OPEN_STATES),
         )
         n = 0
@@ -289,6 +308,19 @@ class OMS:
             return False
         direction = 1 - config.PROTECTIVE_PX_PCT if side == "sell" else 1 + config.PROTECTIVE_PX_PCT
         px = self.data.round_px(inst_id, last_px * direction)
+        notional = None
+        try:
+            notional = self.data.calculate_notional(inst_id, sz, px)
+        except ValueError:
+            log.warning("close_position 规格异常: %s", inst_id)
+        if notional is None:
+            notional = round(px * sz, 2)
+        # P1-8：平仓/减仓也必须经过风控检查（reduce_only 放行开仓类限制）；
+        # Kill Switch 紧急平仓同样经此（reduce_only=True 放行，熔断只拦开仓）
+        self.risk.check_pretrade(
+            inst_id=inst_id, side=side, sz=sz, px=px, notional=notional,
+            reduce_only=True, source="close_position", leverage=int(pos.get("lever") or 1),
+        )
         body: dict = {
             "instId": inst_id, "tdMode": "isolated" if is_swap else "cash",
             "side": side, "ordType": "ioc", "px": str(px), "sz": str(sz),
@@ -356,6 +388,26 @@ class OMS:
                 log.warning("订单查询失败 %s: %s", row["cl_ord_id"], e)
         except Exception as e:
             log.warning("订单查询失败 %s: %s", row["cl_ord_id"], e)
+
+    async def sync_all(self) -> None:
+        """P1-6：断线重连后的主动重同步（balance/positions/open orders）。
+        只处理本地 open 与远程挂单差异（终端态与 fills 由轮询/回调继续校准）。"""
+        try:
+            if self.account:
+                await self.account.refresh()
+            local_open = db.query(
+                f"SELECT * FROM orders WHERE venue='okx' AND state IN ({','.join('?' * len(OPEN_STATES))})",
+                tuple(OPEN_STATES),
+            )
+            if local_open:
+                pend = await self.client.get_pending_orders()
+                remote_ids = {p.get("clOrdId") or p.get("ordId") for p in pend}
+                for row in local_open:
+                    rid = row["cl_ord_id"] or row["ord_id"]
+                    if rid not in remote_ids:
+                        await self._sync_single_order(row)
+        except Exception as e:
+            log.warning("重连重同步失败: %s", e)
 
     async def _reconcile_loop(self) -> None:
         while True:

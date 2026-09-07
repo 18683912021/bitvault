@@ -74,6 +74,22 @@ class OkxWebSocket:
         """channels: [{"channel":"candle1m","instId":"BTC-USDT"}, ...]"""
         self._channels = channels
 
+    async def resubscribe(self, channels: list[dict]) -> None:
+        """动态重订阅（标的切换）：退旧订阅、订新订阅。断开时仅更新列表，重连自动生效。"""
+        old = self._channels
+        self._channels = channels
+        if not self._ws or self.status != "connected":
+            return
+        try:
+            if old:
+                await self._ws.send(json.dumps({"op": "unsubscribe", "args": old}))
+        except Exception as e:
+            log.warning("[%s] 退订阅失败: %s", self.name, e)
+        try:
+            await self._ws.send(json.dumps({"op": "subscribe", "args": channels}))
+        except Exception as e:
+            log.warning("[%s] 订阅失败: %s", self.name, e)
+
     async def start(self) -> None:
         self._stopping = False
         self._tasks.append(asyncio.create_task(self._run()))
@@ -160,6 +176,8 @@ class OkxWebSocket:
     async def _recv_loop(self, ws) -> None:
         async for raw in ws:
             if raw == "pong":
+                # P1-4：pong 必须刷新心跳（否则私有频道静默期每 45s 误超时重连）
+                self.last_msg_ts = time.time()
                 continue
             self.last_msg_ts = time.time()
             try:

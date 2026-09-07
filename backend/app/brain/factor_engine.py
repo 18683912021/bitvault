@@ -106,11 +106,16 @@ def _atr_pct_series(highs: list[float], lows: list[float], closes: list[float],
         trs.append(max(highs[i] - lows[i],
                        abs(highs[i] - closes[i - 1]),
                        abs(lows[i] - closes[i - 1])))
+    # P2-7：滑动窗口 O(n)（原实现每窗口 sum() 为 O(n²)）；结果数学口径完全一致
     out = []
-    for i in range(n, len(trs) + 1):
-        window = trs[i - n:i]
-        px = closes[i]          # 该窗口末端收盘价
-        out.append((sum(window) / n) / px if px > 0 else 0.0)
+    acc = 0.0
+    for i in range(1, len(trs) + 1):
+        acc += trs[i - 1]
+        if i > n:
+            acc -= trs[i - 1 - n]
+        if i >= n:
+            px = closes[i]
+            out.append((acc / n) / px if px > 0 else 0.0)
     return out
 
 

@@ -50,7 +50,7 @@ def main():
         warm = 30 * DAY_MS
         bars = _load(period, sm - warm, em)
         bars_4h = _load("4H", sm - warm, em)
-        bars_1h = _load("1H", sm - warm, em)
+        bars_1h = _load("1D", sm - warm, em)   # P2-4: 1H 交易的 mid-HTF 应为 1D（原误装 1H）
         if len(bars) < 200:
             print(f"[{period}] 数据不足 {len(bars)}，跳过")
             continue

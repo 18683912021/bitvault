@@ -6,6 +6,7 @@ import {
 import { PlayCircleOutlined, ReloadOutlined, DownloadOutlined } from '@ant-design/icons';
 import ParamForm, { schemaDefaults } from '../components/ParamForm';
 import LineChart from '../components/LineChart';
+import InstrumentSelect from '../components/InstrumentSelect';
 import { getTemplates, listBacktests, getBacktestDetail, runBacktest } from '../api/endpoints';
 import { fmtUsd, fmtPct, fmtPx, fmtTime, fmtTimeShort, pnlColor } from '../utils/format';
 import type { StrategyTemplate, BacktestListItem, BacktestDetail } from '../api/types';
@@ -133,7 +134,7 @@ export default function Backtest() {
             <Select value={selectedType} onChange={onTypeChange} options={templates.map((t) => ({ value: t.type, label: t.label }))} />
           </Form.Item>
           <Row gutter={8}>
-            <Col span={12}><Form.Item label="标的" name="inst_id"><Select options={[{ value: 'BTC-USDT', label: 'BTC-USDT' }, { value: 'BTC-USDT-SWAP', label: 'BTC-USDT-SWAP' }]} /></Form.Item></Col>
+            <Col span={12}><Form.Item label="标的" name="inst_id"><InstrumentSelect /></Form.Item></Col>
             <Col span={6}><Form.Item label="周期" name="period"><Select options={['1m','5m','15m','1H','4H','1D'].map((p) => ({ value: p, label: p }))} /></Form.Item></Col>
             <Col span={6}><Form.Item label="天数" name="days"><InputNumber style={{ width: '100%' }} min={1} /></Form.Item></Col>
           </Row>

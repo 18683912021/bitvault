@@ -5,7 +5,7 @@ import type {
   StrategyTemplate, StrategyInstance, BacktestListItem, BacktestDetail,
   RiskStatus, RiskEvent, Notification, AuditLog, RiskRuleEntry,
   Mode, PaperAccount, BrainStatus, BrainHistory,
-  RoundTripSummary, Forecast10,
+  RoundTripSummary, Forecast24,
 } from './types';
 
 // ---------- 系统 ----------
@@ -20,6 +20,11 @@ export interface VenueState {
 export const getVenue = () => api.get<VenueState>('/venue');
 export const setVenue = (venue: 'paper' | 'okx') =>
   api.post<{ ok: boolean; venue: 'paper' | 'okx'; requested: string; fallback: boolean }>('/venue', { venue });
+
+// ---------- 驾驶标的（币种 + 合约/现货） ----------
+export const getInstrument = () => api.get<{ inst_id: string }>('/instrument');
+export const setInstrument = (inst_id: string) =>
+  api.post<{ ok: boolean; inst_id: string; prev_inst_id: string; braked: boolean }>('/instrument', { inst_id });
 
 // ---------- API Key ----------
 export interface ApiKeyRow {
@@ -54,8 +59,10 @@ export const getDepth = (instId: string) => api.get<Book5>('/market/depth', { in
 export const getMarketTrades = (instId: string) => api.get<Trade[]>('/market/trades', { instId });
 export const getFundingRate = (instId = 'BTC-USDT-SWAP') =>
   api.get<Record<string, any>>('/market/funding-rate', { instId });
-export const getForecast10 = (instId = 'BTC-USDT') =>
-  api.get<Forecast10>('/market/forecast10', { instId });
+export const getForecast = (instId?: string) =>
+  api.get<Forecast24>('/market/forecast', instId ? { instId } : {});
+export const getForecast10 = (instId?: string) =>
+  api.get<Forecast24>('/market/forecast10', instId ? { instId } : {});
 export const downloadHistory = (body: { inst_id?: string; period?: string; days?: number }) =>
   api.post<{ ok: boolean; msg: string }>('/market/download-history', body);
 
@@ -152,7 +159,8 @@ export const getRiskRules = () => api.get<Record<string, RiskRuleEntry>>('/risk/
 export const updateRiskRule = (rule_type: string, params: Record<string, any>, enabled: boolean) =>
   api.post<{ ok: boolean }>('/risk/rules', { type: rule_type, params, enabled });
 export const getRiskEvents = (limit = 100) => api.get<RiskEvent[]>('/risk/events', { limit });
-export const killSwitch = () => api.post<{ ok: boolean; report: any }>('/risk/kill-switch');
+export const killSwitch = () =>
+  api.post<{ ok: boolean; report: any }>('/risk/kill-switch', undefined, { confirm: 'true' });
 export const riskResume = () => api.post<{ ok: boolean }>('/risk/resume');
 
 // ---------- 通知 / 审计 ----------

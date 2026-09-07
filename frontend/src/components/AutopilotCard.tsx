@@ -8,13 +8,17 @@ import {
 import { useAppStore } from '../store/useAppStore';
 import { getBrainStatus, updateBrainConfig } from '../api/endpoints';
 import { fmtPx, fmtTime } from '../utils/format';
+import { metaFromId } from './InstrumentSelect';
 import type { BrainStatus } from '../api/types';
 
+// 键与后端 factor_engine.classify_regime 的七态对齐（trend_up/trend_down/low_vol/high_vol/extreme/range/unknown）
 const REGIME_TXT: Record<string, { label: string; color: string }> = {
-  bull_trend: { label: '牛市趋势', color: '#52c41a' },
-  bear_trend: { label: '熊市趋势', color: '#cf1322' },
+  trend_up: { label: '牛市趋势', color: '#52c41a' },
+  trend_down: { label: '熊市趋势', color: '#cf1322' },
   range: { label: '震荡观望', color: '#faad14' },
-  extreme_vol: { label: '极端波动', color: '#ff4d4f' },
+  low_vol: { label: '低波动观望', color: '#8c8c8c' },
+  high_vol: { label: '高波动躁动', color: '#fa8c16' },
+  extreme: { label: '极端波动', color: '#ff4d4f' },
   unknown: { label: '数据不足', color: '#bfbfbf' },
 };
 
@@ -41,13 +45,17 @@ export default function AutopilotCard() {
   const leverage = st?.leverage || 2;
   const isSprint = mode === 'sprint';
 
+  // 冲刺模式默认 10x、稳健模式 2x，均服从风控中心设置的杠杆上限（leverage_cap）
+  const leverCap = st?.leverage_cap ?? 10;
+  const sprintLev = Math.min(10, leverCap);
+  const normalLev = Math.min(2, leverCap);
   const switchMode = (newMode: 'normal' | 'sprint') => {
     if (newMode === mode) return;
-    const newLev = newMode === 'sprint' ? 13 : 2;
+    const newLev = newMode === 'sprint' ? sprintLev : normalLev;
     Modal.confirm({
       title: newMode === 'sprint' ? '切换到冲刺模式？' : '切换到稳健模式？',
       content: newMode === 'sprint'
-        ? `冲刺模式使用 ${newLev}x 杠杆，放大收益也放大风险。策略信号和止损不变，仓位放大 ${newLev} 倍。`
+        ? `冲刺模式使用 ${newLev}x 杠杆（上限 ${leverCap}x），放大收益也放大风险。策略信号和止损不变，仓位放大 ${newLev} 倍。`
         : `稳健模式使用 ${newLev}x 杠杆。策略信号不变，仓位放大 ${newLev} 倍。`,
       okText: '确认',
       cancelText: '取消',
@@ -102,6 +110,9 @@ export default function AutopilotCard() {
           >
             {venue === 'paper' ? '模拟' : '实盘'}
           </Tag>
+          <Tag color="blue" style={{ margin: 0 }}>
+            {metaFromId(st?.inst_id || 'BTC-USDT').label}
+          </Tag>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             {st?.period || '1H'}
           </Typography.Text>
@@ -136,6 +147,11 @@ export default function AutopilotCard() {
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             · {pos ? (pos.side === 'short' ? '持空仓' : '持多仓') : '空仓观望'}
           </Typography.Text>
+          {(st?.positions?.length ?? 0) > 1 && (
+            <Tag color="orange" style={{ margin: 0 }}>
+              另托管 {st!.positions!.filter((q) => q.inst_id !== st?.inst_id).length} 个标的仓位
+            </Tag>
+          )}
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             · 今日 {throttle?.opens_today ?? 0}/{throttle?.max_opens_per_day ?? 20}
           </Typography.Text>
