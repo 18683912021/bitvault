@@ -34,5 +34,9 @@ Thumbs.db
 
 # 本地会话/计划数据（不入库）
 .zcode/
+
+# 服务器部署脚本与指南（含服务器地址，不入库）
+deploy/
+DEPLOY.md
 # 前端构建期令牌（私人注入模式，不入库）
 frontend/.env.production

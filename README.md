@@ -58,8 +58,6 @@ BitVault/
 │   │   ├── components/        # 组件（决策流、预测卡、标的切换等）
 │   │   └── store/             # Zustand 状态
 │   └── vite.config.ts
-├── deploy/                    # 服务器部署：env.example / start.sh / nginx / supervisor
-└── DEPLOY.md                  # 宝塔面板部署指南
 ```
 
 ## 快速开始（本地开发）
@@ -103,7 +101,7 @@ PYTHONPATH=. python -m pytest tests/ -q
 | `BV_PORT` | `8000` | 后端监听端口 |
 | `BV_API_TOKEN` | 空 | 应用层鉴权令牌。**必须配置**，否则交易/敏感接口一律 401 |
 | `BV_OKX_REST_BASE` | `https://www.okx.com` | 大陆服务器连不上主站时切 `https://aws.okx.com` |
-| `BV_OKX_WS_PUBLIC` / `BV_OKX_WS_BUSINESS` / `BV_OKX_WS_PRIVATE` | 主站 WS | 对应 AWS 接入点模板见 `deploy/env.example` |
+| `BV_OKX_WS_PUBLIC` / `BV_OKX_WS_BUSINESS` / `BV_OKX_WS_PRIVATE` | 主站 WS | 对应 AWS 接入点按 `config.py` 头部注释切换 |
 
 OKX API Key **不在环境变量或仓库中**：登录后在 设置 页面配置，前端提交后 AES-256-GCM 加密落库；提交前运行 `/api/keys/test` 校验。OKX 后台创建 Key 时建议只勾「交易」权限、禁「提币」、绑定本机 IP。
 
@@ -117,9 +115,9 @@ OKX API Key **不在环境变量或仓库中**：登录后在 设置 页面配�
 
 ## 部署
 
-服务器部署见 [DEPLOY.md](DEPLOY.md)（宝塔面板：Nginx 反代 + Supervisor 守护 + 一键构建脚本 `deploy/start.sh`）。核心原则：
+本项目为本地部署。核心原则：
 
-1. 后端只监听 `127.0.0.1:8000`，公网仅 80/443，必须上 HTTPS
+1. 后端只监听本机 `127.0.0.1:8000`，对外访问必须走反向代理 + HTTPS
 2. 环境变量走 `backend/.env`（gitignore，不入库）
 3. `backend/data/`（bitvault.db + secret.key）不入库，升级代码不会覆盖，**务必定期备份**
 
