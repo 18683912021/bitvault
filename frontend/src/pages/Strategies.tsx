@@ -261,7 +261,7 @@ function startIt(r: StrategyInstance) {
     okText: '确认启动',
     okType: needConfirm ? 'danger' : 'primary',
     cancelText: '取消',
-    onOk: () => startInstance(r.id, needConfirm),
+    onOk: () => startInstance(r.id),
   });
 }
 
