@@ -264,13 +264,14 @@ class Autopilot:
             candles = self._recent_candles(cfg.get("period", "1H"), inst_id)
             factors = compute_factors(candles) if len(candles) >= 60 else None
             if factors and not factors.get("error"):
-                plan = se.plan_trade(candles, factors, "short" if is_short else "long")
+                plan = se.plan_trade(candles, factors, "short" if is_short else "long", round_px=lambda v: self.data.round_px(inst_id, v))
                 risk_dist = plan["risk_dist"] or entry_px * 0.008
-                sl_px = plan["sl"]
+                sl_px = self.data.round_px(inst_id, plan["sl"])
             else:
                 # 数据不足：退化为 ATR 保守计划（1.5R 止损 / 1R-3R 分批止盈）
                 risk_dist = entry_px * 0.008
-                sl_px = entry_px - (risk_dist * 1.5 if not is_short else -risk_dist * 1.5)
+                sl_px = self.data.round_px(inst_id,
+                                           entry_px - (risk_dist * 1.5 if not is_short else -risk_dist * 1.5))
             sign = -1 if is_short else 1
             self.positions[inst_id] = {
                 "inst_id": inst_id,
@@ -278,9 +279,9 @@ class Autopilot:
                 "side": "short" if is_short else "long",
                 "entry_px": entry_px,
                 "sl_px": sl_px,
-                "tp1_px": round(entry_px + sign * risk_dist * 1.0, 2),
-                "tp2_px": round(entry_px + sign * risk_dist * 2.0, 2),
-                "tp3_px": round(entry_px + sign * risk_dist * 3.0, 2),
+                "tp1_px": self.data.round_px(inst_id, entry_px + sign * risk_dist * 1.0),
+                "tp2_px": self.data.round_px(inst_id, entry_px + sign * risk_dist * 2.0),
+                "tp3_px": self.data.round_px(inst_id, entry_px + sign * risk_dist * 3.0),
                 "sz": sz, "orig_sz": sz,
                 "high_water": max(entry_px, last_px),
                 "low_water": min(entry_px, last_px),
@@ -480,7 +481,7 @@ class Autopilot:
                                      "detail": setup.get("detail")})
                 continue
             score, breakdown = se.score_side(factors, side, setup, htf_4h=htf4h, htf_1h=htf1h)
-            plan = se.plan_trade(candles, factors, side)
+            plan = se.plan_trade(candles, factors, side, round_px=lambda v: self.data.round_px(self.inst_id, v))
             ok, checks = se.check_gate(candles, factors, side, score, plan, ctx)
             quality = {
                 "regime": regime, "regime_reason": factors.get("regime_reason"),
@@ -733,7 +734,7 @@ class Autopilot:
             candles = self._recent_candles(self.config().get("period", "5m"))
             f2 = compute_factors(candles) if len(candles) >= 60 else None
             if f2 and not f2.get("error"):
-                plan = se.plan_trade(candles, f2, side)
+                plan = se.plan_trade(candles, f2, side, round_px=lambda v: self.data.round_px(self.inst_id, v))
                 if plan["rr"] < se.RR_MIN:
                     log.info("价格漂移 %.2f%% 后 RR=%.2f 不达标，放弃",
                              abs(last_px - plan["entry"]) / plan["entry"] * 100, plan["rr"])
@@ -788,11 +789,11 @@ class Autopilot:
                 "inst_id": self.inst_id,
                 "side": side, "sz": float(row.get("sz") or sz_base),
                 "orig_sz": float(row.get("sz") or sz_base),
-                "entry_px": entry, "sl_px": plan["sl"],
+                "entry_px": entry, "sl_px": self.data.round_px(self.inst_id, plan["sl"]),
                 "risk_dist": risk_dist,
-                "tp1_px": round(entry + sign * TP1_R * risk_dist, 2),
-                "tp2_px": round(entry + sign * TP2_R * risk_dist, 2),
-                "tp3_px": round(entry + sign * 3.0 * risk_dist, 2),
+                "tp1_px": self.data.round_px(self.inst_id, entry + sign * TP1_R * risk_dist),
+                "tp2_px": self.data.round_px(self.inst_id, entry + sign * TP2_R * risk_dist),
+                "tp3_px": self.data.round_px(self.inst_id, entry + sign * 3.0 * risk_dist),
                 "tp1_done": False, "tp2_done": False,
                 "high_water": entry, "low_water": entry,
                 "atr_pct": float(quality.get("atr_pct", 0)) or 0,
@@ -810,7 +811,7 @@ class Autopilot:
                 "venue": self.venue,
                 "leverage": leverage,
                 "margin": round(notional * mult, 4),
-                "liq_px": round(entry * (1 - sign * (1.0 / leverage - 0.005)), 2) if leverage > 1 else None,
+                "liq_px": self.data.round_px(self.inst_id, entry * (1 - sign * (1.0 / leverage - 0.005))) if leverage > 1 else None,
             }
             self.positions[self.inst_id]["bars_since_open"] = 0
             self.last_action = side

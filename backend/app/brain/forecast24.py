@@ -71,12 +71,12 @@ def compute(data: Any, inst_id: str = "BTC-USDT") -> dict:
 
     if len(bars_1h) < 30:
         base["note"] = f"1 小时 K 线仅 {len(bars_1h)} 根（需 ≥30），数据积累中，暂不预测"
-        base["ref_price"] = round(data.last_price(inst_id) or 0, 2)
+        base["ref_price"] = _round_px(data, inst_id, data.last_price(inst_id) or 0) or 0.0
         return base
 
     closes = [b["c"] for b in bars_1h]
     ref_price = data.last_price(inst_id) or closes[-1]
-    base["ref_price"] = round(ref_price, 2)
+    base["ref_price"] = _round_px(data, inst_id, ref_price) or 0.0
     closes_l = closes + [ref_price]   # 实时价并入动量/均线（仅已发生数据，无未来函数）
 
     # 市场状态门控（七态）
@@ -167,7 +167,7 @@ def compute(data: Any, inst_id: str = "BTC-USDT") -> dict:
         if side == "short" and _is_spot(data, inst_id):
             suggestion = {"side": "flat", "note": "看跌但现货不可做空，建议观望"}
         else:
-            plan = se.plan_trade(bars_1h, f1, side)
+            plan = se.plan_trade(bars_1h, f1, side, round_px=lambda v: _round_px(data, inst_id, v))
             risk_dist = plan.get("risk_dist") or ref_price * 0.008
             sign = 1 if side == "long" else -1
             suggestion = {

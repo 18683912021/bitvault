@@ -113,7 +113,7 @@ export default function Dashboard() {
             <Statistic
               title={`${base}/USDT`}
               value={curTicker?.last ?? 0}
-              precision={2}
+              precision={curTicker?.last !== undefined && curTicker.last < 1 ? 6 : 2}
               suffix={
                 <Typography.Text style={{ fontSize: 12, color: pnlColor(curChg) || '#999' }}>
                   {fmtPct(curChg)}

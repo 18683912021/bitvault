@@ -305,10 +305,12 @@ def divergence_blocked(candles: list[dict], side: str) -> str:
 
 
 # ================= 交易计划（结构止损 + 结构阻力/支撑复核） =================
-def plan_trade(candles: list[dict], factors: dict, side: str) -> dict:
+def plan_trade(candles: list[dict], factors: dict, side: str, round_px=None) -> dict:
     """结构优先止损：最近有效 Swing Low/High ± 0.3×ATR；无结构用 ATR 兜底。
 
     同时输出 next_resistance / next_support 供"前方空间不足"守卫复核。
+    round_px: 可选价格取整函数（按标的 tickSz）；传入时 sl/tp 按交易所规格取整，
+    不传则保留原始浮点（供回测等无需下单规格的场景）。
     """
     px = float(factors["last_px"])
     atr = float(factors.get("atr_14", 0)) or px * 0.002
@@ -345,9 +347,14 @@ def plan_trade(candles: list[dict], factors: dict, side: str) -> dict:
 
     risk = abs(px - sl)
     reward = abs(tp - px)
+    # round_px 传入时按标的规格取整；否则保留原始精度（round(x,2) 会把微价币种归零）
+    # risk_dist/reward_dist 是价格量（dist 距离），必须保留原始精度——
+    # DOOD 等微价币（~0.001）的 risk≈4e-6，round(,2) 归零会污染 cost/sl_range/
+    # liq_safety/position_size 守卫；比值类（rr/risk_atr_x）保持 round 不变。
     out = {
-        "entry": px, "sl": round(sl, 2), "tp": round(tp, 2),
-        "risk_dist": round(risk, 2), "reward_dist": round(reward, 2),
+        "entry": px, "sl": round_px(sl) if round_px else sl,
+        "tp": round_px(tp) if round_px else tp,
+        "risk_dist": risk, "reward_dist": reward,
         "rr": round(reward / risk, 2) if risk > 0 else 0,
         "rr_target": rr_target, "regime": regime,
         "sl_basis": "structure" if struct_sl is not None else "atr",

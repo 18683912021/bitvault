@@ -28,6 +28,10 @@ export default function MobileHome() {
   const autopilotOn = useAppStore((s) => s.autopilotOn);
   const setAutopilotOn = useAppStore((s) => s.setAutopilotOn);
   const forecast = useMarketStore((s) => s.forecast);
+  // 所选币种实时价（OKX WS 推送，秒级同步）
+  const ticker = useMarketStore((s) => s.tickers[instId]);
+  const livePx = ticker?.last ?? 0;
+  const liveChg = ticker?.open24h ? ((ticker.last - ticker.open24h) / ticker.open24h) * 100 : null;
   const [brain, setBrain] = useState<any>(null);
   const [history, setHistory] = useState<any[]>([]);
   const [paper, setPaper] = useState<any>(null);
@@ -147,8 +151,8 @@ export default function MobileHome() {
 
         {/* 三格统计 */}
         <div className="relative grid grid-cols-3 gap-2 mt-4 text-center">
-          <HeroStat label="今日开仓" value={`${brain?.throttle?.opens_today ?? 0}/${brain?.throttle?.max_opens_per_day ?? 20}`} />
-          <HeroStat label="托管持仓" value={`${posCount} 个`} />
+          <HeroStat label="实时价" value={livePx ? fmtBig(livePx) : '—'} />
+          <HeroStat label="24h 涨跌" value={liveChg != null ? `${liveChg > 0 ? '+' : ''}${liveChg.toFixed(1)}%` : '—'} small />
           <HeroStat label="区间状态" value={REGIME_CN[brain?.regime] || '—'} small />
         </div>
       </div>
@@ -156,7 +160,7 @@ export default function MobileHome() {
       {/* ===== 24h 预测 ===== */}
       <MCard>
         <MCardTitle title="未来24小时预测" extra={
-          <span className="text-[11px] text-white/55">参考 {fmtBig(forecast?.ref_price)}</span>
+          <span className="text-[11px] text-white/55">{livePx ? fmtBig(livePx) : '—'}</span>
         } />
         {forecast && direction !== 'unknown' ? (
           <>

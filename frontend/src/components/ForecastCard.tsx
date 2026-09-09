@@ -1,7 +1,7 @@
 // 未来 24 小时涨跌预测卡（纯规则）：后端每 10 秒计算并经 WS 推送，
 // WS 断开时本组件每 10 秒轮询兜底。精简排版：方向 + 概率 + 建议开平仓价。
 import { useEffect, useState } from 'react';
-import { Card, Col, Row, Tag, Typography, Progress, Tooltip, Space } from 'antd';
+import { Card, Col, Row, Typography, Progress, Tooltip, Space } from 'antd';
 import { ArrowUpOutlined, ArrowDownOutlined, MinusOutlined, QuestionCircleOutlined } from '@ant-design/icons';
 import { useMarketStore } from '../store/useMarketStore';
 import { useAppStore } from '../store/useAppStore';
@@ -14,11 +14,6 @@ const DIR_META: Record<string, { text: string; color: string; icon: JSX.Element 
   down: { text: '看跌', color: '#3f8600', icon: <ArrowDownOutlined /> },
   flat: { text: '震荡', color: '#8c8c8c', icon: <MinusOutlined /> },
   unknown: { text: '数据不足', color: '#d4b106', icon: <QuestionCircleOutlined /> },
-};
-
-const REGIME_LABEL: Record<string, string> = {
-  trend_up: '上升趋势', trend_down: '下降趋势', range: '震荡区间',
-  high_vol: '高波动', low_vol: '低波动', extreme: '极端波动', unknown: '状态未知',
 };
 
 function fmtWindow(ts: number): string {
@@ -84,16 +79,10 @@ export default function ForecastCard() {
               style={{ maxWidth: 90 }}
             />
           </Col>
-          <Col xs={8} md={3}>
-            <div style={{ fontSize: 12, color: '#999' }}>参考价</div>
-            <div style={{ fontSize: 16, fontWeight: 600 }}>{fmtPx(f.ref_price)}</div>
-            <Tag style={{ marginTop: 2 }}>{REGIME_LABEL[f.regime] || f.regime}</Tag>
-          </Col>
-          <Col xs={24} md={12}>
+          <Col xs={24} md={15}>
             {sug ? (
               isLong ? (
                 <Space>
-                  <Tag color="red">建议开多</Tag>
                   <PriceTag label="开仓" v={sug.entry_px} />
                   <PriceTag label="止盈" v={sug.tp1_px} />
                   <PriceTag label="止损" v={sug.sl_px} />
@@ -101,7 +90,6 @@ export default function ForecastCard() {
                 </Space>
               ) : (
                 <Space>
-                  <Tag color="green">建议开空</Tag>
                   <PriceTag label="开仓" v={sug.entry_px} />
                   <PriceTag label="止盈" v={sug.tp1_px} />
                   <PriceTag label="止损" v={sug.sl_px} />
@@ -114,11 +102,6 @@ export default function ForecastCard() {
           </Col>
         </Row>
       )}
-      {f?.note ? (
-        <Typography.Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 8 }}>
-          {f.note}
-        </Typography.Text>
-      ) : null}
     </Card>
   );
 }

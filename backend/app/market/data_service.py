@@ -36,6 +36,10 @@ class DataService:
         self.business_ws_ref = None         # business 端点（candle 频道）
         self._last_trade_ts: dict[str, int] = {}
         self._fallback_task: asyncio.Task | None = None
+        # business 通道"业务心跳"：candle 消息最新时间（candle 低频（5m 一条），
+        # WS alive 不能只看连接/pong——否则 candle 推送断流会被误判健康，导致决策冻结
+        self._last_candle_at: float = 0.0
+        self._biz_force_reconnect_ts: float = 0.0   # 限频：最近一次强制重连时间
         # 全量标的 24h 成交额（USDT），用于选标器按总值排序（随 instruments 同步刷新）
         self.vol24h: dict[str, float] = {}
         self._refresh_task: asyncio.Task | None = None   # 支持集定时重试同步任务
@@ -123,7 +127,12 @@ class DataService:
                 log.warning("支持集刷新失败: %s", e)
 
     async def _load_all_tickers(self) -> None:
-        """全量 ticker 成交额（选标器"按总值排序"的数据源）。失败不阻塞。"""
+        """全量 ticker：成交额（选标器"按总值排序"）+ 价格落 self.tickers。
+
+        现货: volCcy24h 已是 USDT 金额；永续: 它是基础币数量，需乘现价换算成 USDT。
+        价格同时写入 self.tickers，供 last_price/forecast 对任意支持集标的取价
+        （WS 只订阅 active_inst，冷门标的切换后也有价可查）。
+        """
         vols: dict[str, float] = {}
         for inst_type in ("SPOT", "SWAP"):
             try:
@@ -133,12 +142,21 @@ class DataService:
                 continue
             for t in rows:
                 try:
-                    # 现货: volCcy24h 已是 USDT 金额；永续: 它是基础币数量，需乘现价换算成 USDT
                     if inst_type == "SWAP":
                         last = float(t.get("last") or 0)
                         vols[t["instId"]] = float(t.get("volCcy24h") or 0) * last
                     else:
                         vols[t["instId"]] = float(t.get("volCcy24h") or 0)
+                    # 落价格快照（不发布 tick 广播，避免全量风暴）
+                    self.tickers.setdefault(t["instId"], {}).update({
+                        "instId": t["instId"],
+                        "last": float(t.get("last") or 0),
+                        "open24h": float(t.get("open24h") or 0),
+                        "vol24h": float(t.get("vol24h") or 0),
+                        "askPx": float(t.get("askPx") or 0),
+                        "bidPx": float(t.get("bidPx") or 0),
+                        "ts": int(t.get("ts") or time.time() * 1000),
+                    })
                 except (KeyError, TypeError, ValueError):
                     continue
         if vols:
@@ -216,13 +234,15 @@ class DataService:
         return round(round(px / tick) * tick, 10)
 
     # ---------- WS 消息入口 ----------
-    async def on_ws_message(self, msg: dict) -> None:
+    async def on_ws_message(self, msg: dict, via_rest: bool = False) -> None:
+        """WS 与 REST 兜底共用解析入口；via_rest=True 表示数据来自 REST 兜底——
+        不得刷新 business 业务心跳（否则 REST 接管会自我救活，冻结/健康误判）。"""
         arg = msg.get("arg") or {}
         channel = arg.get("channel", "")
         data = msg.get("data") or []
         if channel.startswith("candle"):
             period = channel.replace("candle", "")
-            await self._handle_candles(arg["instId"], period, data)
+            await self._handle_candles(arg["instId"], period, data, via_rest=via_rest)
         elif channel == "tickers":
             for t in data:
                 self.tickers[t["instId"]] = {
@@ -256,7 +276,8 @@ class DataService:
                 del lst[:-50]
                 event_bus.publish("trade", trade)
 
-    async def _handle_candles(self, inst_id: str, period: str, rows: list) -> None:
+    async def _handle_candles(self, inst_id: str, period: str, rows: list,
+                             via_rest: bool = False) -> None:
         """OKX K线数据行: [ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm]；confirm=1 表示该 bar 已收盘。"""
         key = (inst_id, period)
         if key not in self._confirmed:
@@ -268,6 +289,9 @@ class DataService:
             confirm = str(row[8]) if len(row) > 8 else "0"
             bar = {"inst_id": inst_id, "period": period, "ts": ts, "o": o, "h": h, "l": l,
                    "c": c, "vol": vol, "vol_ccy": vol_ccy}
+            if not via_rest:
+                # 仅真实 WS 推送刷新业务心跳；REST 兜底复用本入口但不得自刷新
+                self._last_candle_at = time.time()
             if confirm == "1":
                 if ts > self._confirmed[key]:
                     self._confirmed[key] = ts
@@ -377,7 +401,16 @@ class DataService:
         while True:
             try:
                 pub_alive = self._ws_alive(self.public_ws_ref)
-                biz_alive = self._ws_alive(self.business_ws_ref)
+                biz_alive = self._ws_alive(self.business_ws_ref) and (
+                    time.time() - self._last_candle_at < 150.0)
+                # 自愈：连接看似在但 300s 无任何 candle 数据 → 强制重连（间歇性抖动复位）
+                if (not biz_alive and self.business_ws_ref
+                        and self.business_ws_ref.status == "connected"
+                        and time.time() - self._last_candle_at > 300.0
+                        and time.time() - self._biz_force_reconnect_ts > 60.0):
+                    self._biz_force_reconnect_ts = time.time()
+                    log.warning("business WS 300s 无 candle 数据，强制重连（自愈）")
+                    asyncio.ensure_future(self.business_ws_ref.force_reconnect())
                 self.status["public_ws"] = "connected" if pub_alive else "rest_fallback"
                 self.status["business_ws"] = "connected" if biz_alive else "rest_fallback"
 
@@ -412,7 +445,7 @@ class DataService:
         try:
             rows = await self.client.get_ticker(inst_id)
             if rows:
-                await self.on_ws_message({"arg": {"channel": "tickers", "instId": inst_id}, "data": rows})
+                await self.on_ws_message({"arg": {"channel": "tickers", "instId": inst_id}, "data": rows}, via_rest=True)
         except Exception as e:
             log.debug("poll ticker %s 失败: %s", inst_id, e)
 
@@ -423,7 +456,7 @@ class DataService:
                 # /market/books REST 响应不含 instId 字段，与 WS books5 不同；补齐以复用同一解析逻辑
                 for r in rows:
                     r.setdefault("instId", inst_id)
-                await self.on_ws_message({"arg": {"channel": "books5", "instId": inst_id}, "data": rows})
+                await self.on_ws_message({"arg": {"channel": "books5", "instId": inst_id}, "data": rows}, via_rest=True)
         except Exception as e:
             log.debug("poll books %s 失败: %s", inst_id, e)
 
@@ -431,7 +464,7 @@ class DataService:
         try:
             rows = await self.client.get_trades_public(inst_id, limit=10)
             if rows:
-                await self.on_ws_message({"arg": {"channel": "trades", "instId": inst_id}, "data": rows})
+                await self.on_ws_message({"arg": {"channel": "trades", "instId": inst_id}, "data": rows}, via_rest=True)
         except Exception as e:
             log.debug("poll trades %s 失败: %s", inst_id, e)
 
@@ -439,6 +472,6 @@ class DataService:
         try:
             rows = await self.client.get_candles(inst_id, period, limit=10)
             if rows:
-                await self.on_ws_message({"arg": {"channel": f"candle{period}", "instId": inst_id}, "data": rows})
+                await self.on_ws_message({"arg": {"channel": f"candle{period}", "instId": inst_id}, "data": rows}, via_rest=True)
         except Exception as e:
             log.debug("poll candles %s %s 失败: %s", inst_id, period, e)

@@ -1,12 +1,14 @@
 import { useEffect, useState, useCallback } from 'react';
 import {
   Card, Col, Row, Table, Tag, Button, Form, InputNumber, Switch, Space, Alert,
-  Typography, Input, Divider, Statistic, Empty,
+  Typography, Input, Divider, Statistic, Empty, Select, Modal, message,
 } from 'antd';
 import { ReloadOutlined, UnlockOutlined } from '@ant-design/icons';
 import KillSwitch from '../components/KillSwitch';
 import { useAppStore } from '../store/useAppStore';
-import { getRiskRules, updateRiskRule, getRiskEvents, getRiskStatus, riskResume } from '../api/endpoints';
+import { getRiskRules, updateRiskRule, getRiskEvents, getRiskStatus, riskResume,
+         getBrainStatus, updateBrainConfig } from '../api/endpoints';
+import { PERIODS } from '../utils/format';
 import { fmtPct, fmtUsd, fmtTime } from '../utils/format';
 import type { RiskRuleEntry, RiskEvent } from '../api/types';
 
@@ -27,6 +29,40 @@ export default function Risk() {
   const [events, setEvents] = useState<RiskEvent[]>([]);
   const [editing, setEditing] = useState<string | null>(null);
   const [form] = Form.useForm();
+
+  const [period, setPeriod] = useState<string>('5m');
+  const [savingPeriod, setSavingPeriod] = useState(false);
+
+  const loadBrain = useCallback(async () => {
+    try {
+      const b = await getBrainStatus();
+      setPeriod(b.period || '5m');
+    } catch { /* ignore */ }
+  }, []);
+  useEffect(() => { loadBrain(); }, [loadBrain]);
+
+  const changePeriod = (v: string) => {
+    if (v === period) return;
+    Modal.confirm({
+      title: `将决策周期改为 ${v}？`,
+      content: '自动驾驶将在新周期的每根 K 线收盘评估（开仓条件、风控、杠杆均不变）。',
+      okText: '确认修改',
+      cancelText: '取消',
+      onOk: () => { savePeriod2(v); },
+    });
+  };
+  const savePeriod2 = async (v: string) => {
+    setSavingPeriod(true);
+    try {
+      await updateBrainConfig({ period: v });
+      message.success(`决策周期已切换到 ${v}（立即生效）`);
+    } catch (e: any) {
+      message.error('保存失败：' + (e?.message || '未知错误'));
+      loadBrain();
+    } finally {
+      setSavingPeriod(false);
+    }
+  };
 
   const refresh = useCallback(async () => {
     const [r, ev, st] = await Promise.all([getRiskRules(), getRiskEvents(200), getRiskStatus()]);
@@ -51,6 +87,26 @@ export default function Risk() {
     <div>
       <Row gutter={16}>
         <Col xs={24} lg={10}>
+          <Card size="small" title="自动驾驶 · 决策周期" style={{ marginBottom: 16 }}>
+            <Space direction="vertical" style={{ width: '100%' }}>
+              <Space wrap>
+                <Typography.Text type="secondary">每根 K 线收盘评估一次，当前周期：</Typography.Text>
+                <Select
+                  size="small"
+                  style={{ width: 110 }}
+                  value={period}
+                  onChange={(v) => changePeriod(v as string)}
+                  disabled={savingPeriod}
+                  options={PERIODS.map((p) => ({ value: p, label: p }))}
+                />
+                {savingPeriod && <Typography.Text type="secondary" style={{ fontSize: 12 }}>保存中…</Typography.Text>}
+              </Space>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                选择新周期并确认后立即生效（无需重启）；开仓条件/风控/杠杆等均不变。当前运行状态与开关在顶栏。
+              </Typography.Text>
+            </Space>
+          </Card>
+
           <Card size="small" title="熔断状态">
             {risk?.halted ? (
               <Alert

@@ -74,6 +74,15 @@ class OkxWebSocket:
         """channels: [{"channel":"candle1m","instId":"BTC-USDT"}, ...]"""
         self._channels = channels
 
+    async def force_reconnect(self) -> None:
+        """强制重连：关闭当前连接，_run 循环会按新 backoff 重连并重新订阅全部频道。
+        用于"连接看似在但业务数据断流"的自愈（如 business candle 通道 300s 无推送）。"""
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+
     async def resubscribe(self, channels: list[dict]) -> None:
         """动态重订阅（标的切换）：退旧订阅、订新订阅。断开时仅更新列表，重连自动生效。"""
         old = self._channels

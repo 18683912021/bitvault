@@ -54,6 +54,11 @@ export default function Market() {
   const bestBid = depth?.bids?.[0]?.[0] ?? 0;
   const bestAsk = depth?.asks?.[0]?.[0] ?? 0;
   const spread = bestAsk && bestBid ? bestAsk - bestBid : 0;
+  // 独立实时行情（OKX WS tick 推送，每秒同步）：最新价大字 + 24h 涨跌/成交量
+  const ticker = useMarketStore((s) => s.tickers[instId]);
+  const lastPx = ticker?.last ?? 0;
+  const chg = ticker?.open24h ? ((ticker.last - ticker.open24h) / ticker.open24h) * 100 : null;
+  const pxColor = pnlColor(chg);
 
   const doSubmit = async (vals: any) => {
     const body = {
@@ -129,6 +134,20 @@ export default function Market() {
         style={{ marginBottom: 16 }}
         styles={{ body: { padding: '8px 16px' } }}
       >
+        {/* 独立实时行情（OKX 同步）：最新价大字 + 24h 涨跌 + 买一卖一 */}
+        <Space wrap style={{ marginBottom: 8 }}>
+          <Typography.Text strong style={{ fontSize: 20, color: pxColor || '#333' }}>
+            {lastPx ? fmtPx(lastPx) : '--'}
+          </Typography.Text>
+          {chg != null ? (
+            <Typography.Text style={{ fontSize: 16, color: pxColor || '#999', fontWeight: 600 }}>
+              {chg > 0 ? '+' : ''}{chg.toFixed(2)}%
+            </Typography.Text>
+          ) : null}
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            24h 量 {ticker?.vol24h ? ticker.vol24h.toLocaleString('zh-CN', { maximumFractionDigits: 0 }) + ' ' + (isSwap ? '张' : base) : '--'}
+          </Typography.Text>
+        </Space>
         <Space wrap>
           <InstrumentSelect switcher />
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>

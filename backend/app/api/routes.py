@@ -389,9 +389,6 @@ async def brain_update_config(request: Request, body: dict):
         raise HTTPException(400, "决策大脑未就绪")
     old_cfg = s.brain.config()
     new_cfg = {**old_cfg}
-    sm = new_cfg.get("strategy_mode")
-    if sm not in (None, "official", "research_pullback"):
-        raise HTTPException(400, "strategy_mode 仅支持 official / research_pullback")
     allowed = {"mode", "leverage", "period", "max_order_usdt", "require_setup",
                "setup_filter", "cooldown_min", "max_opens_per_day",
                "loss_pause_n", "loss_pause_min", "daily_loss_limit_usdt",
@@ -399,6 +396,14 @@ async def brain_update_config(request: Request, body: dict):
     for k in allowed:
         if k in body:
             new_cfg[k] = body[k]
+    # 校验必须在 allowed 赋值之后（否则校验的是旧值，非法值仍会被写入）
+    sm = new_cfg.get("strategy_mode")
+    if sm not in (None, "official", "research_pullback"):
+        raise HTTPException(400, "strategy_mode 仅支持 official / research_pullback")
+    # 决策周期白名单（防呆：非法值会使 bar 事件与周期永不匹配 → 决策静默冻结）
+    valid_periods = {"1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D", "1W"}
+    if new_cfg.get("period") not in valid_periods:
+        raise HTTPException(400, f"决策周期非法（允许：{sorted(valid_periods)}）")
     lev = int(new_cfg.get("leverage", 2) or 2)
     if lev < 1:
         lev = 1

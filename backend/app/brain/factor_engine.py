@@ -359,22 +359,25 @@ def compute_factors(candles: list[dict]) -> dict[str, Any]:
     macd_v, macd_sig, macd_hist = _macd(closes)
 
     out = {
-        "last_px": round(last_px, 2),
+        # 交易决策输入字段（ema_slow/atr_14/macd_hist 被 detect_setup/score/plan_trade 消费）：
+        # 保留原始精度——微价币（如 DOOD，价格 ~0.0017）若 round(,2) 会归零，导致 setup 探测
+        # 与 fallback（or last / or last*0.002）被触发、决策失真；展示/日志层如需精度单独格式化。
+        "last_px": last_px,
         "return_1m": round(ret_1 * 100, 3),
         "return_5m": round(ret_5 * 100, 3),
         "return_15m": round(ret_15 * 100, 3),
         "rsi_14": round(_rsi(closes, 14), 2),
         "macd": round(macd_v, 2),
         "macd_signal": round(macd_sig, 2),
-        "macd_hist": round(macd_hist, 2),
+        "macd_hist": macd_hist,
         "bb_pos": round(bb_pos, 3),
-        "atr_14": round(atr, 2),
+        "atr_14": atr,
         "atr_pct": round(atr_pct * 100, 3),
         "vol_pct": round(vol_pct, 3),
         "trend": trend,
         "trend_strength": round(trend_strength * 100, 3),
         "ema_fast": round(ema_fast, 2),
-        "ema_slow": round(ema_slow, 2),
+        "ema_slow": ema_slow,
         "volume_ratio": round(volume_ratio, 3),
     }
     # 确定性市场状态（含 ADX / 极端波动 / 价格偏离）——评分与守卫的权威输入
