@@ -105,7 +105,8 @@ export const resetPaperAccount = (initial = 10000) =>
 export const getBrainStatus = () => api.get<BrainStatus>('/brain/status');
 export const startAutopilot = (overrides?: { period?: string; min_confidence?: number }) =>
   api.post<{ ok: boolean; config: any }>('/brain/autopilot/start', overrides || {});
-export const stopAutopilot = () => api.post<{ ok: boolean; config: any }>('/brain/autopilot/stop');
+export const stopAutopilot = () =>
+  api.post<{ ok: boolean; config: any }>('/brain/autopilot/stop', undefined, { confirm: 'true' });
 export const updateBrainConfig = (body: Record<string, any>) =>
   api.post<{ ok: boolean; config: any }>('/brain/config', body);
 export const getBrainHistory = (limit = 20) =>
@@ -124,16 +125,16 @@ export interface InstanceIn {
 }
 export const createInstance = (body: InstanceIn) =>
   api.post<{ id: number }>('/strategies/instances', body);
-export const startInstance = (id: number, confirm = false) =>
-  api.post<{ ok: boolean; status: string }>(`/strategies/instances/${id}/start`, { confirm });
+export const startInstance = (id: number) =>
+  api.post<{ ok: boolean; status: string }>(`/strategies/instances/${id}/start`);
 export const stopInstance = (id: number, close_position = false) =>
   api.post<{ ok: boolean }>(`/strategies/instances/${id}/stop`, { close_position });
 export const pauseInstance = (id: number) =>
-  api.post<{ ok: boolean }>(`/strategies/instances/${id}/pause`);
+  api.post<{ ok: boolean }>(`/strategies/instances/${id}/pause`, undefined, { confirm: 'true' });
 export const resumeInstance = (id: number) =>
-  api.post<{ ok: boolean }>(`/strategies/instances/${id}/resume`);
+  api.post<{ ok: boolean }>(`/strategies/instances/${id}/resume`, undefined, { confirm: 'true' });
 export const deleteInstance = (id: number) =>
-  api.del<{ ok: boolean }>(`/strategies/instances/${id}`);
+  api.del<{ ok: boolean }>(`/strategies/instances/${id}`, { confirm: 'true' });
 export const getInstanceLogs = (id: number) =>
   api.get<any[]>(`/strategies/instances/${id}/logs`);
 
