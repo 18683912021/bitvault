@@ -331,6 +331,7 @@ export interface RiskRuleEntry {
 export interface RiskStatus {
   halted: boolean;
   halt_reason: string;
+  venue?: 'paper' | 'okx';
   day_key?: string;
   day_start_equity?: number;
   daily_pnl_pct: number;

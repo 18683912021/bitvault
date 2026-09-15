@@ -107,7 +107,8 @@ export default function Risk() {
             </Space>
           </Card>
 
-          <Card size="small" title="熔断状态">
+          <Card size="small"
+            title={`熔断状态（${risk?.venue === 'paper' ? '模拟盘' : '实盘'}口径）`}>
             {risk?.halted ? (
               <Alert
                 type="error"

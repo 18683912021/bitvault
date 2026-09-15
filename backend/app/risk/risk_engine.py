@@ -36,7 +36,8 @@ class RiskEngine:
         self._order_ts: list[float] = []
         self.oms = None        # 注入
         self.manager = None    # 注入
-        self.account = None    # 注入
+        self.account = None    # 注入：实盘账户（OKX）
+        self.paper = None      # 注入：PaperEngine（模拟盘账户摘要，venue=paper 的占比校验用）
         self.env = "none"      # 未连接 Key 前为 none；连接 demo/live Key 后由 Services 更新
         self._breaker_lock = asyncio.Lock()
         # 生效的杠杆上限：以风控中心 risk_rules.leverage_cap 为准（可在页面编辑），
@@ -64,6 +65,21 @@ class RiskEngine:
 
     def _rule(self, rule_type: str):
         return self.rules.get(rule_type)
+
+    def _venue_account(self, venue: str) -> tuple[float, list[dict]]:
+        """按 venue 取（权益, 持仓）：paper→模拟盘账户，其余→实盘账户。
+
+        两路账户绝不混用：模拟盘订单若拿实盘权益做占比校验，空实盘账户（0.003U）
+        会把任何模拟盘订单判成"占比超限"而全部拦死；反之亦然。
+        """
+        if venue == "paper":
+            if not self.paper:
+                return 0.0, []
+            s = self.paper.summary()
+            return float(s.get("equity") or 0), list(s.get("positions") or [])
+        if not self.account:
+            return 0.0, []
+        return float(self.account.equity() or 0), list(self.account.positions or [])
 
     # ================= 事前拦截 =================
     def check_pretrade(
@@ -104,25 +120,22 @@ class RiskEngine:
             raise RiskBlocked(f"单笔金额 {notional:.2f} USDT 超过上限 {r['params']['max_usdt']}")
 
         r = self._rule("max_position_pct")
-        if r and r["enabled"] and not reduce_only and (self.account or self.paper):
-            if self.account:
-                equity = self.account.equity()
-                positions = self.account.positions
-            else:
-                psum = self.paper.summary() if self.paper else {}
-                equity = float(psum.get("equity") or 0)
-                positions = psum.get("positions") or []
+        if r and r["enabled"] and not reduce_only:
+            # 按订单所属 venue 取账户：模拟盘单只看模拟盘权益，实盘单只看实盘权益
+            equity, positions = self._venue_account(venue)
             if equity > 0:
                 pos_notional = 0.0
                 for p in positions:
-                    # SWAP 持仓 notionalUsd 为美元名义价值；现货按 数量×市价
-                    pos_notional += float(p.get("notionalUsd") or 0) or abs(
+                    # SWAP 持仓 notionalUsd 为美元名义价值；paper 行直接带 notional；现货按 数量×市价
+                    pos_notional += float(p.get("notionalUsd") or p.get("notional") or 0) or abs(
                         float(p.get("pos") or p.get("sz") or 0) * (
-                            float(p.get("markPx") or p.get("avgPx") or p.get("entry_px") or 0)))
+                            float(p.get("markPx") or p.get("avgPx") or p.get("last")
+                                  or p.get("entry_px") or 0)))
                 if (pos_notional + notional) / equity * 100 > float(r["params"]["pct"]):
                     db.add_risk_event("max_position_pct", "warning", "blocked",
-                                      {"pos_notional": round(pos_notional, 2), "equity": round(equity, 2)})
-                    raise RiskBlocked("仓位占比超过上限")
+                                      {"venue": venue, "pos_notional": round(pos_notional, 2),
+                                       "equity": round(equity, 2)})
+                    raise RiskBlocked(f"仓位占比超过上限（{venue}）")
 
     # ================= 事中监控 =================
     def _trigger_breaker(self, reason: str) -> None:
@@ -207,15 +220,22 @@ class RiskEngine:
             avail = equity
         self.on_equity(equity, avail=avail, venue="okx")
 
-    def status(self) -> dict:
-        equity = self.account.equity() if self.account else 0
-        start = self.state.get("okx_day_start_equity") or 0
-        peak = self.state.get("okx_peak_equity") or 0
+    def status(self, venue: str | None = None) -> dict:
+        """风控状态。venue 决定口径：paper 看模拟盘账户、其余看实盘账户。
+
+        修复：原实现固定读 okx_* 基线 + 旧键 "day_key"，于是模拟盘模式下页面上的
+        日内盈亏/回撤显示的是实盘账户的数字，day_key 也永远停在上一次写旧键的日期。
+        """
+        v = venue or "okx"
+        equity, _ = self._venue_account(v)
+        start = self.state.get(f"{v}_day_start_equity") or 0
+        peak = self.state.get(f"{v}_peak_equity") or 0
         return {
+            "venue": v,
             "halted": self.state.get("halted", False),
             "halt_reason": self.state.get("halt_reason", ""),
             "reduce_hint": bool(self.state.get("reduce_hint", False)),
-            "day_key": self.state.get("day_key"),
+            "day_key": self.state.get(f"{v}_day_key"),
             "day_start_equity": start,
             "daily_pnl_pct": round((equity - start) / start * 100, 2) if start else 0,
             "peak_equity": peak,
@@ -279,7 +299,12 @@ class RiskEngine:
         """人工解除熔断（需在 UI 显式操作）。"""
         self.state["halted"] = False
         self.state["halt_reason"] = ""
-        self.state["day_start_equity"] = self.account.equity() if self.account else None
+        # 按 venue 重新锚定当日基线；旧键 day_start_equity 已废弃，写它等于没写
+        self.state.pop("day_start_equity", None)
+        for v in ("okx", "paper"):
+            eq, _ = self._venue_account(v)
+            if eq > 0:
+                self.state[f"{v}_day_start_equity"] = eq
         db.set_setting("risk_state", self.state)
         db.add_audit(actor, "risk_resume", {}, "ok")
         event_bus.publish("risk", {"event": "resumed"})

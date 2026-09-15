@@ -138,6 +138,8 @@ class Services:
         await self.data.start_rest_fallback()
         # 本地模拟盘：无 Key 常驻可用（paper 模式）
         self.paper = PaperEngine(self.data, self.risk)
+        # P0-4：模拟盘账户接入风控（max_position_pct 按 venue 取账户，paper 单不得用实盘权益校验）
+        self.risk.paper = self.paper
         await self.paper.start()
         # Autopilot（纯规则自动驾驶）
         self.brain = Autopilot(self.data, self.paper, self.risk)

@@ -69,7 +69,7 @@ async def health(request: Request):
         "last_decision_at": last_dec,
         "last_order_at": last_order,
         "last_error": "",
-        "risk": s.risk.status(),
+        "risk": s.risk.status(s.venue),
         "strategy_health": health_status(s.venue),
     }
 
@@ -88,7 +88,7 @@ async def status(request: Request):
         "private_ws": s.private_ws.status if s.private_ws else "no_key",
         "public_ws": s.public_ws.status if s.public_ws else "disconnected",
         "business_ws": s.business_ws.status if s.business_ws else "disconnected",
-        "risk": s.risk.status(),
+        "risk": s.risk.status(s.venue),
         "account_config": s.account.account_config if s.account else {},
         "whitelist": sorted(config.InstrumentRegistry.supported),
         "strategy_types": [
@@ -685,7 +685,8 @@ async def backtest_detail(bid: int, request: Request):
 # ================= 风控 =================
 @router.get("/risk/status")
 async def risk_status(request: Request):
-    return svc(request).risk.status()
+    s = svc(request)
+    return s.risk.status(s.venue)
 
 
 @router.get("/risk/rules")

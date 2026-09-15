@@ -25,7 +25,7 @@ async def ws_endpoint(websocket: WebSocket):
             "data": {
                 "tickers": s.data.tickers,
                 "env": s.env,
-                "risk": s.risk.status(),
+                "risk": s.risk.status(s.venue),
             },
         }, ensure_ascii=False, default=str))
         while True:
