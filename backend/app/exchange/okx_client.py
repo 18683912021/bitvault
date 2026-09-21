@@ -230,3 +230,27 @@ class OkxClient:
 
     async def get_fills(self, inst_id: str, limit: int = 100) -> list[dict]:
         return await self.request("GET", "/api/v5/trade/fills", {"instId": inst_id, "limit": limit})
+
+    # ---- 算法单（交易所侧动态止损的撤旧挂新）----
+    async def place_algo_order(self, order: dict) -> list[dict]:
+        """挂条件单。本系统用于交易所侧止损：ordType=conditional + slTriggerPx/slOrdPx。"""
+        return await self.request("POST", "/api/v5/trade/order-algo", body=order)
+
+    async def cancel_algo_orders(self, orders: list[dict]) -> list[dict]:
+        """批量撤条件单；orders 形如 [{"instId": ..., "algoId": ...}, ...]。"""
+        return await self.request("POST", "/api/v5/trade/cancel-algos", body=orders)
+
+    async def get_pending_algo_orders(self, inst_id: str, ord_type: str = "conditional") -> list[dict]:
+        """查询该标的尚未触发的条件单（用于同步前撤旧，避免多张止损并存）。"""
+        return await self.request(
+            "GET", "/api/v5/trade/orders-algo-pending",
+            {"instId": inst_id, "ordType": ord_type},
+        )
+
+    async def amend_algo_order(self, order: dict) -> list[dict]:
+        """原地修改条件单的触发价/数量（newSlTriggerPx/newSz）。
+
+        仅支持 TP/SL 类算法单且仅限合约（官方限制）；现货需走撤旧挂新路径。
+        相比"撤旧挂新"没有保护空窗，也不会误撤他人挂单。
+        """
+        return await self.request("POST", "/api/v5/trade/amend-algos", body=order)

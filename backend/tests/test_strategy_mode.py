@@ -50,6 +50,7 @@ def test_autopilot_status_exposes_mode():
     ap.last_factors = {"regime": "range"}
     ap.last_action = "flat"
     ap.positions = {}
+    ap._dust_notes = {}          # 新增状态：无法下单平掉的残仓（见 test_position_dust.py）
     ap.throttle_status = lambda: {}
     ap.risk = None
     st = ap.status()

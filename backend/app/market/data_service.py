@@ -19,6 +19,16 @@ PERIOD_MS = {
     "12H": 43_200_000, "1D": 86_400_000, "1W": 604_800_000,
 }
 
+# 数量规格化时的浮点容差。
+# 背景：0.05723/1e-06 在 IEEE754 下得 57229.99999999999，int() 截断成 57229，
+# 使本应是整手倍数的平仓量少平 1e-06，日积月累形成无法交易的 dust 残仓。
+LOT_EPS = 1e-9
+
+
+def floor_lots(ratio: float) -> int:
+    """把手数倍数向下取整，并容忍浮点表示误差（绝对值 + 相对值双重容差）。"""
+    return int(ratio + max(LOT_EPS, abs(ratio) * 1e-12))
+
 
 class DataService:
     """依赖一个公共（免签）OkxClient 与行情 WS。"""
@@ -235,17 +245,96 @@ class DataService:
         if not ins:
             return 0, f"未知标的 {inst_id}"
         if ins["instType"] == "SWAP" and ins["ctVal"] > 0:
-            contracts = int(sz / ins["ctVal"])  # 向下取整
+            contracts = floor_lots(sz / ins["ctVal"])   # 向下取整（容忍浮点误差）
             if contracts < 1:
                 return 0, f"数量不足 1 张（1张={ins['ctVal']} BTC）"
             return float(contracts), None
         lot = ins["lotSz"]
-        normalized = int(sz / lot) * lot
+        normalized = floor_lots(sz / lot) * lot
         # 浮点清理
         normalized = float(f"{normalized:.8f}")
         if normalized < ins["minSz"]:
             return 0, f"数量低于最小下单量 {ins['minSz']}"
         return normalized, None
+
+    def spec_step(self, inst_id: str) -> tuple[float, float, str]:
+        """返回 (最小步长, 最小下单量, 单位名)——**均为 sz_base 口径（币量）**。
+
+        现货：步长=lotSz、最小量=minSz；
+        SWAP：1 张 = ctVal 币量 → 步长=最小量=ctVal（调用方一律用币量，避免张/币混算）。
+        用于判断某个持仓量是否**根本不可交易**（低于最小下单量 → 只会形成 dust）。
+        """
+        ins = self.instrument(inst_id)
+        if not ins:
+            return 0.0, 0.0, ""
+        if ins.get("instType") == "SWAP" and float(ins.get("ctVal") or 0) > 0:
+            ct = float(ins["ctVal"])
+            return ct, ct, "币"          # 1 张 = ctVal 币量
+        lot = float(ins.get("lotSz") or 0) or 1e-8
+        return lot, float(ins.get("minSz") or 0) or lot, "币"
+
+    def plan_close_sz(self, inst_id: str, cur_sz: float,
+                       want_sz: float | None = None) -> dict:
+        """平仓数量规划（防 dust）：把"想平的量"变成"能提交的最小合规量"。
+
+        cur_sz / want_sz / 返回的 submit、dust_after 均为 **sz_base 口径（币量）**；
+        normalize_sz 对 SWAP 返回的是张数，此处统一折回币量，避免张/币混算。
+
+        返回 {submit, full, dust_after, untradable, note}：
+          - untradable=True：整仓低于最小下单量，**无法通过任何下单成交**（真 dust）
+          - submit=0 且 untradable=False：本次分批低于最小下单量，跳过（保留仓位）
+          - full=True 且 note 非空：剩余会变成 dust → 尾部归零，改为整仓平
+
+        背景：分批止盈按比例平仓（如 25%）经 int() 规格化会截断，
+        两笔合计留下低于 minSz 的残值 → 该残值永远无法平掉（见 ETH 残仓事故）。
+        """
+        ins = self.instrument(inst_id)
+        if not ins:
+            return {"submit": 0.0, "full": False, "dust_after": 0.0,
+                    "untradable": False, "note": f"未知标的 {inst_id}"}
+        cur = float(cur_sz or 0)
+        if cur <= 0:
+            return {"submit": 0.0, "full": False, "dust_after": 0.0,
+                    "untradable": False, "note": ""}
+        _step, min_sz, unit = self.spec_step(inst_id)
+        is_swap = ins.get("instType") == "SWAP"
+        ct = float(ins.get("ctVal") or 0)
+
+        def _norm_base(x: float) -> tuple[float, str | None]:
+            """规格化并统一折回币量（SWAP：张 → 币量）。"""
+            out, err = self.normalize_sz(inst_id, x)
+            if err or out <= 0:
+                return 0.0, err or "规格化后为 0"
+            if is_swap and ct > 0:
+                return out * ct, None
+            return out, None
+
+        full_req = want_sz is None or float(want_sz) >= cur - 1e-12
+        if full_req:
+            submit, err = _norm_base(cur)
+            if err:
+                # 整仓都不可交易（低于最小下单量）→ dust，任何下单都会被拒
+                return {"submit": 0.0, "full": True, "dust_after": cur, "untradable": True,
+                        "note": f"整仓 {cur:g} {unit} 低于最小下单量 {min_sz:g} {unit}，不可交易"}
+            return {"submit": submit, "full": True,
+                    "dust_after": max(0.0, cur - submit), "untradable": False, "note": ""}
+
+        want = min(float(want_sz), cur)
+        submit, err = _norm_base(want)
+        if err or submit <= 0:
+            # 分批量本身低于最小下单量：无法提交（保留仓位，交由后续 TP/止损再决策）
+            return {"submit": 0.0, "full": False, "dust_after": cur, "untradable": False,
+                    "note": f"分批平仓量 {want:g} {unit} 低于最小下单量 {min_sz:g}，跳过"}
+        rest = cur - submit
+        if 0 < rest < min_sz - 1e-12:
+            # 剩余会成为不可交易的 dust → 尾部归零，整仓平（仍是减仓方向，安全）
+            full_submit, err2 = _norm_base(cur)
+            if not err2 and full_submit > 0:
+                return {"submit": full_submit, "full": True,
+                        "dust_after": max(0.0, cur - full_submit), "untradable": False,
+                        "note": f"平仓后剩余 {rest:g} {unit} 低于最小下单量 {min_sz:g}，改为整仓平（防 dust）"}
+        return {"submit": submit, "full": False, "dust_after": rest,
+                "untradable": False, "note": ""}
 
     def round_px(self, inst_id: str, px: float) -> float:
         ins = self.instrument(inst_id)

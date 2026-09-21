@@ -296,6 +296,162 @@ class OMS:
             db.add_audit("system", "cancel_all_orders", {}, f"canceled={n}")
         return n
 
+    async def find_position_sl(self, inst_id: str, pos_side: str = "long") -> dict | None:
+        """查找该标的上「属于本仓位方向」且尚未触发的交易所侧止损单。
+
+        过滤：有 slTriggerPx、state ∈ {live, pause}、side = 平仓方向、双向模式下 posSide 匹配。
+        找不到返回 None；查询本身失败会抛异常（由调用方决定处置）。
+        """
+        ins = self.data.instrument(inst_id)
+        if not ins:
+            return None
+        is_swap = ins["instType"] == "SWAP"
+        close_side = "sell" if pos_side == "long" else "buy"
+        want_pos_side = self.account.pos_side_for(close_side, True) if is_swap else None
+        rows = await self.client.get_pending_algo_orders(inst_id)
+        for r in (rows if isinstance(rows, list) else []):
+            if not r.get("slTriggerPx"):
+                continue
+            if str(r.get("state") or "live") not in ("live", "pause"):
+                continue
+            if r.get("side") and str(r["side"]) != close_side:
+                continue
+            if want_pos_side and r.get("posSide") and str(r["posSide"]) != want_pos_side:
+                continue
+            return {"algo_id": str(r.get("algoId") or ""),
+                    "sl_trigger_px": float(r.get("slTriggerPx") or 0),
+                    "sz": float(r.get("sz") or 0),
+                    "state": r.get("state"), "side": r.get("side"), "pos_side": r.get("posSide")}
+        return None
+
+    async def sync_position_sl(self, inst_id: str, sl_px: float, pos_side: str = "long",
+                               sz: float | None = None, algo_id: str | None = None) -> dict:
+        """把交易所侧止损同步到新的 sl_px（安全版：任何路径都不留"无保护"窗口）。
+
+        按优先级：
+          1) 合约且已定位到旧止损单 → **amend-algos 原地改触发价**（无空窗、不误撤）
+          2) 否则（现货 / amend 失败 / 未找到旧单）→ **先挂新、再撤旧**：
+             - 挂新失败 → 旧单仍在（**保护不中断**），返回 ok=False
+             - 挂新成功 → 撤旧时按 side/posSide/state 过滤，**校验逐项 sCode**，
+               并排除刚挂的新单（避免自撤）
+        返回 {"ok", "mode", "algo_id", "canceled", "cancel_errors", "sl_px"} 或 {"ok": False, "err"}；
+        失败不静默——写审计与日志，由调用方告警并记录状态。
+        """
+        ins = self.data.instrument(inst_id)
+        if not ins:
+            return {"ok": False, "mode": None, "err": f"未知标的 {inst_id}"}
+        trigger = self.data.round_px(inst_id, float(sl_px))
+        if trigger <= 0:
+            return {"ok": False, "mode": None, "err": f"止损价非法：{sl_px}"}
+        if not sz or float(sz) <= 0:
+            return {"ok": False, "mode": None, "err": "缺少持仓量（sz），拒绝挂止损"}
+        is_swap = ins["instType"] == "SWAP"
+        close_side = "sell" if pos_side == "long" else "buy"
+        want_pos_side = self.account.pos_side_for(close_side, True) if is_swap else None
+        new_sz = str(sz)
+
+        # ---- 1) 定位现有止损单（调用方缓存优先，否则查交易所；只认属于本方向的）----
+        target: dict | None = None
+        if algo_id:
+            target = {"algo_id": algo_id}
+        else:
+            try:
+                target = await self.find_position_sl(inst_id, pos_side)
+            except Exception as e:
+                db.add_audit("system", "sync_exchange_sl",
+                             {"inst_id": inst_id, "sl_px": trigger, "stage": "query"},
+                             f"query_fail:{e}")
+                return {"ok": False, "mode": None, "err": f"查询交易所止损失败：{e}"}
+
+        # ---- 2) 原地改（仅合约）：无空窗，也不会误撤他人挂单 ----
+        if target and target.get("algo_id") and is_swap:
+            amend_err = ""
+            try:
+                resp = await self.client.amend_algo_order({
+                    "instId": inst_id, "algoId": target["algo_id"],
+                    "newSlTriggerPx": str(trigger), "newSz": new_sz,
+                })
+                code = str(resp[0].get("sCode", "")) if resp else "-1"
+                if code == "0":
+                    db.add_audit("system", "sync_exchange_sl",
+                                 {"inst_id": inst_id, "sl_px": trigger, "mode": "amend",
+                                  "algo_id": target["algo_id"]}, "ok")
+                    return {"ok": True, "mode": "amend", "algo_id": target["algo_id"],
+                            "canceled": 0, "cancel_errors": 0, "sl_px": trigger}
+                amend_err = f"[{code}] {resp[0].get('sMsg', '') if resp else ''}"
+            except Exception as e:
+                amend_err = str(e)
+            db.add_audit("system", "sync_exchange_sl",
+                         {"inst_id": inst_id, "sl_px": trigger, "mode": "amend",
+                          "algo_id": target.get("algo_id")}, f"amend_fail:{amend_err}")
+            log.warning("amend-algos 失败，回退为「先挂新后撤旧」%s：%s", inst_id, amend_err)
+
+        # ---- 3) 先挂新：失败则旧单仍在，保护不中断 ----
+        body: dict = {
+            "instId": inst_id,
+            "tdMode": "cash" if not is_swap else "isolated",
+            "side": close_side,
+            "ordType": "conditional",
+            "sz": new_sz,
+            "slTriggerPx": str(trigger),
+            "slOrdPx": "-1",
+        }
+        if is_swap:
+            body["posSide"] = want_pos_side
+            if body["posSide"] == "net":
+                body["reduceOnly"] = True
+        try:
+            resp = await self.client.place_algo_order(body)
+        except Exception as e:
+            db.add_audit("system", "sync_exchange_sl",
+                         {"inst_id": inst_id, "sl_px": trigger, "body": body}, f"place_fail:{e}")
+            return {"ok": False, "mode": None, "err": f"挂新止损失败（旧止损仍在）：{e}"}
+        s_code = str(resp[0].get("sCode", "")) if resp else "-1"
+        if s_code != "0":
+            s_msg = resp[0].get("sMsg", "") if resp else ""
+            db.add_audit("system", "sync_exchange_sl",
+                         {"inst_id": inst_id, "sl_px": trigger, "body": body},
+                         f"rejected:{s_code} {s_msg}")
+            return {"ok": False, "mode": None,
+                    "err": f"交易所拒绝止损单 [{s_code}] {s_msg}（旧止损仍在）"}
+        new_algo_id = str(resp[0].get("algoId") or "")
+
+        # ---- 4) 撤旧：方向/状态过滤 + 校验逐项 sCode + 排除刚挂的新单 ----
+        canceled = cancel_errors = 0
+        try:
+            rows = await self.client.get_pending_algo_orders(inst_id)
+            targets = []
+            for r in (rows if isinstance(rows, list) else []):
+                aid = str(r.get("algoId") or "")
+                if not aid or aid == new_algo_id:
+                    continue
+                if not r.get("slTriggerPx"):
+                    continue
+                if str(r.get("state") or "live") not in ("live", "pause"):
+                    continue
+                if r.get("side") and str(r["side"]) != close_side:
+                    continue
+                if want_pos_side and r.get("posSide") and str(r["posSide"]) != want_pos_side:
+                    continue
+                targets.append({"instId": inst_id, "algoId": aid})
+            if targets:
+                cresp = await self.client.cancel_algo_orders(targets)
+                for it in (cresp if isinstance(cresp, list) else []):
+                    if str(it.get("sCode", "")) == "0":
+                        canceled += 1
+                    else:
+                        cancel_errors += 1
+        except Exception as e:
+            cancel_errors += 1
+            log.warning("撤销旧止损失败 %s（新止损已挂上，保护不中断）：%s", inst_id, e)
+
+        db.add_audit("system", "sync_exchange_sl",
+                     {"inst_id": inst_id, "sl_px": trigger, "sz": sz, "mode": "replace",
+                      "algo_id": new_algo_id, "canceled": canceled, "cancel_errors": cancel_errors},
+                     "ok" if cancel_errors == 0 else "ok_with_cancel_errors")
+        return {"ok": True, "mode": "replace", "algo_id": new_algo_id,
+                "canceled": canceled, "cancel_errors": cancel_errors, "sl_px": trigger}
+
     async def close_position(self, pos: dict) -> bool:
         inst_id = pos["instId"]
         ins = self.data.instrument(inst_id)

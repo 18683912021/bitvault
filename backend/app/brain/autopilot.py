@@ -143,6 +143,7 @@ TP2_R, TP2_PCT = 2.0, 0.35   # 2R 平 35%，激活 ATR trailing
 TRAIL_ATR = 2.5              # trailing 距离 = 2.5×ATR（不低于保本价）
 TIME_STOP_BARS = 120         # 时间止损：120 根 bar 未到 TP1 且浮亏 → 离场
 MAX_CLOSE_RETRIES = 3        # P0-4：平仓最大重试次数，超出则触发 exchange 重同步
+SL_SYNC_RETRY_SEC = 30       # 交易所侧止损同步失败后的重试间隔（限流，防每 tick 重复下单）
 
 
 class Autopilot:
@@ -168,6 +169,11 @@ class Autopilot:
         self._daily_realized_pnl: float = 0.0   # 当日已实现净盈亏（USDT）
         self._dd_pct: float = 0.0              # 缓存当前回撤供风控降档用
         self._close_retries: dict[str, int] = {}  # P0-4：按 inst_id 累计平仓重试次数
+        # 无法下单平掉的残仓（低于最小下单量）记录：inst_id -> 明细。
+        # 这类残仓**不进入 self.positions**，因此不阻塞开仓（has_position）。
+        self._dust_notes: dict[str, dict] = {}
+        self._dust_notified: set[str] = set()
+        self._close_fail_notify_ts: dict[str, int] = {}   # 平仓失败告警限流
 
     def bind_svc(self, svc) -> None:
         """注入 Services 容器：autopilot 据此读取系统级 venue 与实盘 oms/account。"""
@@ -257,6 +263,8 @@ class Autopilot:
         场景：venue 切换/标的切换后 positions 中被清空/未收养，但实际持仓仍在。
         收养时用当前因子重算 SL/TP（不知道原始计划，保守处理）。
         支持多空双向：paper lev_positions 有 side 字段；OKX SWAP pos 正=多 负=空。
+        P0-5：低于最小下单量的残仓（任何下单都平不掉）**不收养**，走 dust 处理——
+        否则会被无限收养成"正常持仓"，把 has_position 永久占住（ETH 残仓事故）。
         """
         positions = acct.get("positions") or []
         for p in positions:
@@ -266,6 +274,11 @@ class Autopilot:
                 continue
             if not self.data.is_supported(inst_id):
                 continue
+            _step, min_sz, unit = self.data.spec_step(inst_id)
+            if min_sz > 0 and self._sz_venue_to_intent(inst_id, sz) < min_sz - 1e-12:
+                # 不可交易残仓：不收养（paper 会被 purge_dust 清掉，okx 只记录+告警）
+                self._handle_untradable(inst_id, sz, f"低于最小下单量 {min_sz:g} {unit}")
+                continue
             pos_side = p.get("side", "long")   # paper: "long"/"short"; OKX: 默认 long
             is_short = pos_side == "short"
             entry_px = float(p.get("entry_px") or 0) or self.data.last_price(inst_id)
@@ -274,16 +287,18 @@ class Autopilot:
             lev = int(cfg.get("leverage", 1) or 1)
             candles = self._recent_candles(cfg.get("period", "1H"), inst_id)
             factors = compute_factors(candles) if len(candles) >= 60 else None
+            sign = -1 if is_short else 1
+            # 锚点一致性：SL 与 TP1/TP2/TP3 一律以「真实开仓价 entry_px」为基准。
+            # 旧实现 SL 取 plan["sl"]（它锚定的是"收养时的市价"），而 TP 锚定 entry_px；
+            # 当市价已明显偏离开仓价（如 P > entry + risk_dist）时，多头 SL 会落到开仓价之上。
             if factors and not factors.get("error"):
                 plan = se.plan_trade(candles, factors, "short" if is_short else "long", round_px=lambda v: self.data.round_px(inst_id, v))
                 risk_dist = plan["risk_dist"] or entry_px * 0.008
-                sl_px = self.data.round_px(inst_id, plan["sl"])
+                sl_px = self.data.round_px(inst_id, entry_px - sign * risk_dist)
             else:
                 # 数据不足：退化为 ATR 保守计划（1.5R 止损 / 1R-3R 分批止盈）
                 risk_dist = entry_px * 0.008
-                sl_px = self.data.round_px(inst_id,
-                                           entry_px - (risk_dist * 1.5 if not is_short else -risk_dist * 1.5))
-            sign = -1 if is_short else 1
+                sl_px = self.data.round_px(inst_id, entry_px - sign * risk_dist * 1.5)
             self.positions[inst_id] = {
                 "inst_id": inst_id,
                 "cl_ord_id": "discovered",
@@ -462,6 +477,10 @@ class Autopilot:
         # 发现已有持仓（venue 切换后收养，防重复开仓）
         self._discover_position(acct)
         self._sync_delegated()                     # P0-2：收养持仓后同步行情订阅
+
+        # 重启/收养后：从交易所读回已有止损单写入 exch_sl（仅 okx，每仓位一次）
+        for _iid, _p in list(self.positions.items()):
+            await self._recover_exchange_sl(_iid, _p)
 
         # 持仓中：持仓管理走 tick + signal-exit，不开新仓
         if self.position:
@@ -645,12 +664,19 @@ class Autopilot:
         )
 
     def _next_wait_cn(self, eval_details: list, setup_filter: str) -> str:
-        """下一步各方向等待什么（问题3）。"""
+        """下一步各方向等待什么（问题3）。
+
+        返回最多两条：多头等待句 + 空头等待句。空头若出现普通回踩（pullback），
+        空头句换成"等待有效突破 + 回踩 + 确认"，否则用默认句（下方 len==1 分支补）。
+        注意 wants 初始只有多头 1 条，追加空头句必须用 append——
+        曾用 wants[1] = ... 直接索引赋值，在"空头 pullback 且无入场信号"时
+        抛 IndexError 中断整个观望报告。
+        """
         want_cn = _SETUP_CN.get(setup_filter, setup_filter or "指定形态")
         wants = ["多头：等待现有多头入场形态（优先" + want_cn + "）"]
         for d in eval_details:
             if d.get("side") == "short" and d.get("setup") == "pullback":
-                wants[0], wants[1] = wants[0], "空头：等待有效突破 + 回踩 + 确认（当前仅普通回踩）"
+                wants.append("空头：等待有效突破 + 回踩 + 确认（当前仅普通回踩）")
                 break
         if len(wants) == 1:
             wants.append("空头：等待有效突破回踩（突破 + 回踩 + 确认）")
@@ -901,50 +927,327 @@ class Autopilot:
                 reason=f"Signal Exit：收盘 {last_close:.0f} 涨破 EMA21 {ema21:.0f} 且 MACD 转正")
 
     # ---------- 平仓 ----------
+    def _sz_venue_to_intent(self, inst_id: str, venue_sz: float) -> float:
+        """venue 持仓口径 → place_intent 的 sz_base 口径（现货=币量；SWAP=张数→币量）。
+
+        持仓对象 pos["sz"] 始终是 venue 口径（OKX SWAP 为张数），而下单管道
+        normalize_sz 期望币量（SWAP 内部再折张），平仓提交前必须换算一次。
+        """
+        ins = self.data.instrument(inst_id) or {}
+        if ins.get("instType") == "SWAP":
+            ct = float(ins.get("ctVal") or 0)
+            if ct > 0:
+                return float(venue_sz) * ct
+        return float(venue_sz)
+
+    def _sz_intent_to_venue(self, inst_id: str, base_sz: float) -> float:
+        """place_intent 的 sz_base 口径 → venue 持仓口径（_sz_venue_to_intent 的逆）。"""
+        ins = self.data.instrument(inst_id) or {}
+        if ins.get("instType") == "SWAP":
+            ct = float(ins.get("ctVal") or 0)
+            if ct > 0:
+                return float(base_sz) / ct
+        return float(base_sz)
+
+    def _venue_pos_sz(self, inst_id: str) -> float | None:
+        """venue 侧实际持仓量（venue 口径）：无持仓返回 0.0，读不到返回 None。"""
+        try:
+            acct = self._account_summary()
+        except Exception as e:
+            log.debug("venue 持仓读取失败 %s: %s", inst_id, e)
+            return None
+        for p in (acct.get("positions") or []):
+            if (p.get("inst_id") or "") == inst_id:
+                return float(p.get("sz") or 0)
+        return 0.0
+
+    def _post_close_size(self, inst_id: str, cur_venue: float, submit_venue: float,
+                         filled_venue: float) -> float:
+        """平仓后剩余持仓量（venue 口径）。
+
+        优先用 venue 实际持仓（P0-4）；venue 快照尚未反映本次成交（OKX 私有 WS 有延迟）时，
+        退回"按实际成交量扣减"（P0-3：绝不按未规格化的意向量记账）。
+        """
+        venue_sz = self._venue_pos_sz(inst_id)
+        if venue_sz is not None and venue_sz < cur_venue - 1e-12:
+            return max(0.0, venue_sz)
+        used = filled_venue if filled_venue > 0 else submit_venue
+        return max(0.0, cur_venue - used)
+
+    async def _on_close_failed(self, inst_id: str, reason: str, err: Exception) -> None:
+        """平仓失败统一出口（P0-2）：计数 → 告警 → 超限升级并触发交易所重同步。
+
+        旧实现只在 place_intent 返回空/state=dead 时才进入重试；异常（例如数量被
+        normalize_sz 以"低于最小下单量"抛出的 RiskBlocked）被 except 吞掉，
+        止损失效在 UI 上完全静默——这是 ETH 残仓仓位长期卡住未被发现的原因之一。
+        """
+        retry = self._close_retries.get(inst_id, 0) + 1
+        self._close_retries[inst_id] = retry
+        log.error("autopilot 平仓失败 %s（第 %d 次）：%s", inst_id, retry, err)
+        now_ms = int(time.time() * 1000)
+        escalated = retry > MAX_CLOSE_RETRIES
+        if escalated:
+            # 升级告警不受限流抑制（失败已持续，必须让人看到）
+            self._close_fail_notify_ts[inst_id] = now_ms
+            self._notify("autopilot_close_failed", "error",
+                         f"{inst_id} 平仓连续 {retry - 1} 次失败（{reason}）：{err}；"
+                         f"已触发交易所持仓重同步，请人工核实该仓位",
+                         {"inst_id": inst_id, "reason": reason, "error": str(err),
+                          "retry": retry, "escalated": True})
+        elif retry == 1 and now_ms - self._close_fail_notify_ts.get(inst_id, 0) >= 60_000:
+            # 首次失败告警按标的限流 60s，避免 tick 级重试刷爆通知表
+            self._close_fail_notify_ts[inst_id] = now_ms
+            self._notify("autopilot_close_failed", "warning",
+                         f"{inst_id} 平仓失败（{reason}）：{err}；将继续重试",
+                         {"inst_id": inst_id, "reason": reason, "error": str(err),
+                          "retry": retry, "escalated": False})
+        if escalated:
+            self._close_retries.pop(inst_id, None)   # 交给重同步收尾，重新计数
+            await self._sync_from_exchange(inst_id)
+
+    def _handle_untradable(self, inst_id: str, venue_sz: float, note: str) -> dict:
+        """venue 侧存在"低于最小下单量、任何下单都平不掉"的残仓（P0-5/P0-6/P0-7）。
+
+        - paper：交给 PaperEngine.purge_dust 由模拟盘自行改账清理（**不产生任何订单**）
+        - okx  ：交易所残值无法用下单清掉 → 只记录并告警，**绝不当成托管持仓**
+        两种情况都把本地托管仓位摘掉，避免 tick 循环反复尝试注定失败的平仓，
+        也避免 has_position 永久阻塞新开仓。
+        """
+        self.positions.pop(inst_id, None)
+        self._close_retries.pop(inst_id, None)
+        self._sync_delegated()
+        cleaned: list[dict] = []
+        if self.venue != "okx" and hasattr(self.paper, "purge_dust"):
+            try:
+                cleaned = self.paper.purge_dust(inst_id)
+            except Exception as e:
+                log.warning("paper purge_dust 失败 %s: %s", inst_id, e)
+        left = self._venue_pos_sz(inst_id)
+        record = {
+            "inst_id": inst_id, "sz": float(venue_sz), "note": note, "venue": self.venue,
+            "cleaned": bool(cleaned), "remaining": None if left is None else float(left),
+            "ts": int(time.time() * 1000),
+        }
+        self._dust_notes[inst_id] = record
+        if inst_id not in self._dust_notified:
+            self._dust_notified.add(inst_id)
+            self._notify("autopilot_dust", "warning",
+                         f"{inst_id} 残仓 {venue_sz:g} 低于最小下单量（{note}）："
+                         + ("模拟盘已自动清理，不再占用持仓槽位"
+                            if cleaned else
+                            "交易所残值无法通过下单平掉，已停止托管以免阻塞开仓，请人工处理"),
+                         record)
+        log.warning("dust 残仓 %s sz=%s cleaned=%s note=%s", inst_id, venue_sz, bool(cleaned), note)
+        return record
+
+    async def _sync_exchange_sl(self, inst_id: str, pos: dict, reason: str) -> None:
+        """本地动态止损变更后，把交易所侧止损同步过去（仅 okx live）。
+
+        - paper 无交易所侧止损，直接跳过
+        - 同价不重复下单；只允许朝有利方向移动（多头只上移、空头只下移），绝不回退
+        - 复用已知 algo_id 免去每次查询；失败记录失败次数与时间戳，交由限流重试兜底
+        - 失败不静默：error 日志 + 告警 + 状态记录在 pos["exch_sl"]（status() 里可见）
+        """
+        if self.venue != "okx":
+            return
+        if inst_id not in self.positions or float(pos.get("sz") or 0) <= 0:
+            return                                   # 已清仓则无需保护
+        sl = float(pos.get("sl_px") or 0)
+        if sl <= 0:
+            return
+        ex = self._executor()
+        sync = getattr(ex, "sync_position_sl", None)
+        if sync is None:
+            log.warning("交易所止损同步跳过 %s：下单引擎不支持 sync_position_sl", inst_id)
+            return
+        is_short = pos.get("side") == "short"
+        prev = pos.get("exch_sl") or {}
+        prev_px = float(prev.get("px") or 0)
+        if prev.get("ok") and abs(prev_px - sl) < 1e-12:
+            return                                   # 已同步到该价位
+        if prev.get("ok") and prev_px > 0:
+            # 单调性：多头只允许上移、空头只允许下移
+            if (not is_short and sl <= prev_px) or (is_short and sl >= prev_px):
+                log.warning("交易所止损同步被拒 %s：新价 %s 非有利方向（上次 %s）", inst_id, sl, prev_px)
+                return
+        try:
+            res = await sync(inst_id, sl, pos_side=pos.get("side", "long"),
+                             sz=float(pos.get("sz") or 0),
+                             algo_id=(prev.get("algo_id") or None) if prev.get("ok") else None)
+        except Exception as e:
+            res = {"ok": False, "mode": None, "err": str(e)}
+        ok = bool(res.get("ok"))
+        prev_fail = int(prev.get("fail_count") or 0)
+        pos["exch_sl"] = {"px": sl, "ok": ok, "reason": reason,
+                          "ts": int(time.time() * 1000),
+                          "mode": res.get("mode") or "",
+                          "algo_id": res.get("algo_id") or (prev.get("algo_id") or ""),
+                          "canceled": res.get("canceled", 0),
+                          "cancel_errors": res.get("cancel_errors", 0),
+                          "fail_count": 0 if ok else prev_fail + 1,
+                          "err": (res.get("err") or "")[:200]}
+        if ok:
+            log.info("交易所止损已同步 %s → %s（%s，mode=%s 撤销旧单 %s 张）",
+                     inst_id, sl, reason, res.get("mode"), res.get("canceled", 0))
+            if res.get("cancel_errors"):
+                log.warning("交易所止损同步 %s：新止损已挂上，但有 %s 张旧单撤销失败（下次同步会再纠正）",
+                            inst_id, res.get("cancel_errors"))
+        else:
+            log.error("交易所止损同步失败 %s → %s（%s）：%s", inst_id, sl, reason, res.get("err"))
+            self._notify("autopilot_sl_sync", "error",
+                         f"{inst_id} 交易所侧止损同步失败（{reason}）：{res.get('err')}；"
+                         f"本地止损仍为 {sl:g}，将在 {SL_SYNC_RETRY_SEC}s 后重试，请留意交易所侧保护",
+                         {"inst_id": inst_id, "sl_px": sl, "reason": reason,
+                          "err": res.get("err"), "venue": self.venue,
+                          "fail_count": prev_fail + 1})
+
+    async def _maybe_retry_exchange_sl(self, inst_id: str, pos: dict) -> None:
+        """失败后的限流重试：只在"上次同步失败、SL 未再变化、且距上次尝试 ≥ 30s"时重试一次。
+
+        平时的 tick 直接返回（不查询、不下单），保证不会每 tick 重复创建订单。
+        """
+        if self.venue != "okx":
+            return
+        st = pos.get("exch_sl") or {}
+        if st.get("ok") or not st.get("px"):
+            return                                   # 未失败 / 无记录 → 无需重试
+        now_ms = int(time.time() * 1000)
+        if now_ms - int(st.get("ts") or 0) < SL_SYNC_RETRY_SEC * 1000:
+            return                                   # 同一次失败限流窗口内不重试
+        sl = float(pos.get("sl_px") or 0)
+        if abs(float(st.get("px") or 0) - sl) > 1e-12:
+            return                                   # SL 已变化 → 交给正常同步路径
+        log.warning("交易所止损同步重试 %s（第 %s 次失败后）", inst_id, int(st.get("fail_count") or 0))
+        await self._sync_exchange_sl(inst_id, pos, st.get("reason") or "重试")
+
+    async def _recover_exchange_sl(self, inst_id: str, pos: dict) -> None:
+        """重启/收养后：从交易所读回已有止损单，写入 pos["exch_sl"]。
+
+        否则重启后本地不知道交易所已有止损 → 单调性守卫失效、且可能重复挂单。
+        仅在本地没有 exch_sl 记录时执行（每个仓位生命周期一次）。
+        """
+        if self.venue != "okx" or pos.get("exch_sl"):
+            return
+        if float(pos.get("sz") or 0) <= 0:
+            return
+        ex = self._executor()
+        find = getattr(ex, "find_position_sl", None)
+        if find is None:
+            return
+        try:
+            found = await find(inst_id, pos.get("side", "long"))
+        except Exception as e:
+            log.warning("读取交易所已有止损失败 %s：%s", inst_id, e)
+            return
+        if found and found.get("algo_id"):
+            pos["exch_sl"] = {"px": float(found.get("sl_trigger_px") or 0), "ok": True,
+                              "reason": "重启恢复", "source": "recovered",
+                              "algo_id": found["algo_id"], "ts": int(time.time() * 1000),
+                              "mode": "", "canceled": 0, "cancel_errors": 0, "fail_count": 0, "err": ""}
+            log.info("已恢复交易所止损记录 %s：algo=%s slTriggerPx=%s",
+                     inst_id, found["algo_id"], found.get("sl_trigger_px"))
+
     async def _close_position(self, inst_id: str | None = None, reason: str = "",
-                              sz: float | None = None) -> None:
+                              sz: float | None = None) -> dict:
+        """平仓：数量规格化防 dust + 失败可见 + 平仓后与 venue 对账。
+
+        1) 平仓量先经 plan_close_sz 规划：分批低于最小下单量则跳过；平仓后会留下
+           不可交易残值则整仓平（尾部归零）——从源头杜绝 dust 残仓。
+        2) 下单异常不再被静默吞掉，统一走 _on_close_failed（重试/告警/重同步）。
+        3) 成交后以 venue 实际持仓为准回填本地 sz（对不上则说明本地记账有误，交由
+           _sync_from_exchange 纠正）。
+        """
         inst_id = inst_id or self.inst_id
         pos = self.positions.get(inst_id)
         if not pos:
-            return
-        sell_sz = min(sz if sz is not None else pos["sz"], pos["sz"])
-        if sell_sz <= 1e-12:
-            return
+            return {"ok": False, "reason": "no_position"}
+        cur_venue = float(pos.get("sz") or 0)
+        if cur_venue <= 0:
+            self.positions.pop(inst_id, None)
+            self._sync_delegated()
+            return {"ok": False, "reason": "zero_size"}
+        # P0-5：venue 实际持仓是"大于 0 但低于最小下单量"的残值 → 直接按 dust 收尾，
+        # 不再试注定被拒的下单。注意 venue 读数为 0 不在此列：那属于"幽灵持仓"，
+        # 语义不同（也可能是 okx 快照滞后），仍走正常平仓→失败重试→重同步链路。
+        venue_now = self._venue_pos_sz(inst_id)
+        if venue_now is not None and venue_now > 0:
+            _s, min_now, unit_now = self.data.spec_step(inst_id)
+            if min_now > 0 and self._sz_venue_to_intent(inst_id, venue_now) < min_now - 1e-12:
+                self._handle_untradable(
+                    inst_id, venue_now,
+                    f"venue 实际持仓低于最小下单量 {min_now:g} {unit_now}")
+                return {"ok": False, "reason": "untradable"}
         is_short = pos.get("side") == "short"
         close_side = "buy" if is_short else "sell"
+        dir_tag = "平空" if is_short else "平多"
+
+        cur_base = self._sz_venue_to_intent(inst_id, cur_venue)
+        want_base = None if sz is None else self._sz_venue_to_intent(
+            inst_id, min(float(sz), cur_venue))
+        plan = self.data.plan_close_sz(inst_id, cur_base, want_base)
+        if plan["untradable"]:
+            # 整仓低于最小下单量：任何下单都会被拒 → 不再空转，转 dust 流程
+            self._handle_untradable(inst_id, cur_venue, plan["note"])
+            return {"ok": False, "reason": "untradable", "note": plan["note"]}
+        if plan["submit"] <= 0:
+            log.info("平仓跳过 %s（%s）：%s", inst_id, reason, plan["note"])
+            return {"ok": False, "reason": "skipped", "note": plan["note"]}
+
+        submit_base = float(plan["submit"])
+        submit_venue = self._sz_intent_to_venue(inst_id, submit_base)
         try:
             row = await self._executor().place_intent({
                 "inst_id": inst_id, "side": close_side, "ord_type": "market",
-                "sz_base": sell_sz, "reduce_only": True, "source": "autopilot:close",
+                "sz_base": submit_base, "reduce_only": True, "source": "autopilot:close",
                 "leverage": int(pos.get("leverage", 1) or 1),
             })
-            # P0-4：检查平仓单是否被成功接受；失败则重试，超出上限触权重同步
-            if not row or row.get("state") == "dead":
-                retry = self._close_retries.get(inst_id, 0) + 1
-                self._close_retries[inst_id] = retry
-                if retry > MAX_CLOSE_RETRIES:
-                    log.warning("autopilot 平仓 %s 连续 %d 次失败，触发 exchange 重同步", inst_id, retry)
-                    self._close_retries.pop(inst_id, None)
-                    await self._sync_from_exchange(inst_id)
-                return
-            self._close_retries.pop(inst_id, None)   # 成功后重置计数
-            pos["sz"] -= sell_sz
-            fully = pos["sz"] <= 1e-12
-            if fully:
-                self._last_close_ts = int(time.time() * 1000)
-                self._update_loss_streak(inst_id)
-                self._journal_close(inst_id, pos, reason)
-                self.positions.pop(inst_id, None)
-                self._sync_delegated()                 # P0-2：持仓清空 → 退订该标的行情频道
-                if inst_id == self.inst_id:
-                    self.last_action = "flat"
-            dir_tag = "平空" if is_short else "平多"
-            self._notify("autopilot_close", "info",
-                         f"{dir_tag} {sell_sz:.6f}（{'全部' if fully else '部分'}，{reason}）",
-                         {"reason": reason, "sz": sell_sz, "fully": fully, "side": pos.get("side")})
-            log.info("autopilot %s sz=%.6f reason=%s fully=%s", dir_tag, sell_sz, reason, fully)
         except Exception as e:
-            log.error("autopilot 平仓失败: %s", e)
+            await self._on_close_failed(inst_id, reason, e)
+            return {"ok": False, "reason": "exception", "error": str(e)}
+        if not row or row.get("state") == "dead":
+            await self._on_close_failed(inst_id, reason, RuntimeError("平仓单未被接受（state=dead/空）"))
+            return {"ok": False, "reason": "rejected"}
+
+        # ---- 成交成功：重置失败计数，并按实际成交/venue 持仓回填本地数量 ----
+        self._close_retries.pop(inst_id, None)
+        self._close_fail_notify_ts.pop(inst_id, None)
+        filled_venue = 0.0
+        cl_ord_id = row.get("cl_ord_id")
+        if cl_ord_id:
+            o = db.query_one("SELECT filled_sz FROM orders WHERE cl_ord_id=?", (cl_ord_id,))
+            if o:
+                filled_venue = float(o.get("filled_sz") or 0)
+        new_venue = self._post_close_size(inst_id, cur_venue, submit_venue, filled_venue)
+        _step, min_sz, unit = self.data.spec_step(inst_id)
+        new_base = self._sz_venue_to_intent(inst_id, new_venue)
+
+        if new_venue <= 0 or (min_sz > 0 and new_base < min_sz - 1e-12):
+            if new_venue > 0:
+                # 平掉后才暴露出"剩余低于最小下单量"→ 立即按 dust 收尾，不留给下一轮
+                self._handle_untradable(inst_id, new_venue,
+                                        f"平仓后剩余 {new_venue:g} {unit} 低于最小下单量 {min_sz:g}")
+                return {"ok": True, "fully": True, "filled": submit_venue, "dust": True}
+            self._last_close_ts = int(time.time() * 1000)
+            self._update_loss_streak(inst_id)
+            self._journal_close(inst_id, pos, reason)   # 落库用的仍是平仓前的 sz/orig_sz
+            self.positions.pop(inst_id, None)
+            self._sync_delegated()                 # P0-2：持仓清空 → 退订该标的行情频道
+            if inst_id == self.inst_id:
+                self.last_action = "flat"
+            self._notify("autopilot_close", "info",
+                         f"{dir_tag} {submit_venue:.6f}（全部，{reason}）",
+                         {"reason": reason, "sz": submit_venue, "fully": True, "side": pos.get("side")})
+            log.info("autopilot %s sz=%.6f reason=%s fully=True", dir_tag, submit_venue, reason)
+            return {"ok": True, "fully": True, "filled": submit_venue}
+
+        pos["sz"] = new_venue                        # P0-3：本地数量=venue 实际剩余
+        self._notify("autopilot_close", "info",
+                     f"{dir_tag} {submit_venue:.6f}（部分，{reason}）",
+                     {"reason": reason, "sz": submit_venue, "fully": False,
+                      "side": pos.get("side"), "left": new_venue})
+        log.info("autopilot %s sz=%.6f reason=%s fully=False left=%.6f",
+                 dir_tag, submit_venue, reason, new_venue)
+        return {"ok": True, "fully": False, "filled": submit_venue, "left": new_venue}
 
     async def _sync_from_exchange(self, inst_id: str) -> None:
         """P0-4：从交易所账户同步指定标的的持仓状态，纠正本地幽灵持仓。
@@ -991,6 +1294,17 @@ class Autopilot:
             return
         is_short = pos.get("side") == "short"
 
+        # P0-5/P0-6：持仓量已低于最小下单量 → 止损/止盈下单注定被拒，转 dust 收尾，
+        # 不在 tick 上反复空转（否则每 tick 一次注定失败的下单 + 一条 error 日志）。
+        _step, _min_sz, _unit = self.data.spec_step(inst_id)
+        _venue_sz = float(pos.get("sz") or 0)
+        if _min_sz > 0 and self._sz_venue_to_intent(inst_id, _venue_sz) < _min_sz - 1e-12:
+            self._handle_untradable(inst_id, _venue_sz, f"低于最小下单量 {_min_sz:g} {_unit}")
+            return
+
+        # 交易所止损同步失败后的限流重试（平时立即返回，不查询也不下单）
+        await self._maybe_retry_exchange_sl(inst_id, pos)
+
         # 水位追踪：多头 high_water（最高价）/ 空头 low_water（最低价）
         if "high_water" not in pos:
             pos["high_water"] = pos["entry_px"]
@@ -1020,6 +1334,7 @@ class Autopilot:
             pos["sl_px"] = pos["entry_px"]  # 保本
             await self._close_position(inst_id, reason=f"TP1 到达 1R 平 25% @ {px:.2f}",
                                        sz=pos["orig_sz"] * TP1_PCT)
+            await self._sync_exchange_sl(inst_id, pos, "TP1 保本")   # 交易所侧止损跟随到保本
             return
         # 3. TP2：2R 平 35% + 激活 trailing
         tp2_hit = (px <= pos["tp2_px"]) if is_short else (px >= pos["tp2_px"])
@@ -1033,16 +1348,22 @@ class Autopilot:
             atr_abs = pos["atr_pct"] / 100 * pos["entry_px"] if pos["atr_pct"] else pos["risk_dist"] / 1.8
             if is_short:
                 trail = min(pos["entry_px"], pos["low_water"] + TRAIL_ATR * atr_abs)
+                old_sl = pos["sl_px"]
                 pos["sl_px"] = min(pos["sl_px"], trail)  # 空头止损只下移
                 if px >= trail:
                     await self._close_position(inst_id, reason=f"ATR trailing @ {px:.2f} ≥ {trail:.2f}")
                     return
+                if pos["sl_px"] != old_sl:               # 仅真正变化时同步交易所侧
+                    await self._sync_exchange_sl(inst_id, pos, "ATR trailing")
             else:
                 trail = max(pos["entry_px"], pos["high_water"] - TRAIL_ATR * atr_abs)
+                old_sl = pos["sl_px"]
                 pos["sl_px"] = max(pos["sl_px"], trail)  # 多头止损只上移
                 if px <= trail:
                     await self._close_position(inst_id, reason=f"ATR trailing @ {px:.2f} ≤ {trail:.2f}")
                     return
+                if pos["sl_px"] != old_sl:               # 仅真正变化时同步交易所侧
+                    await self._sync_exchange_sl(inst_id, pos, "ATR trailing")
         # 5. 3R 全平
         tp3_hit = (px <= pos["tp3_px"]) if is_short else (px >= pos["tp3_px"])
         if pos["tp1_done"] and tp3_hit:
@@ -1106,6 +1427,8 @@ class Autopilot:
         self._paper_peak_equity = 0.0
         self._peak_venue = None
         self.positions = {}
+        self._close_retries.clear()
+        self._close_fail_notify_ts.clear()
         self._sync_delegated()                     # P0-2：重置后同步退订行情
 
     def on_venue_switch(self) -> None:
@@ -1123,6 +1446,11 @@ class Autopilot:
         self._sleep_until = 0
         self._paper_peak_equity = 0.0
         self._peak_venue = None
+        # dust 记录按 venue 隔离：切走时清掉旧 venue 的，避免误报/混淆
+        self._dust_notes.clear()
+        self._dust_notified.clear()
+        self._close_retries.clear()
+        self._close_fail_notify_ts.clear()
         # 立即发现新 venue 已有持仓
         try:
             acct = self._account_summary()
@@ -1222,6 +1550,8 @@ class Autopilot:
                 }
                 for k, v in self.positions.items()
             ],
+            # 低于最小下单量、无法下单平掉的残仓（不参与托管，仅供前端/排障可见）
+            "dust": [dict(v) for v in self._dust_notes.values()],
             "throttle": self.throttle_status(),
             "mode": cfg.get("mode", "normal"),
             "strategy_mode": cfg.get("strategy_mode", "official"),

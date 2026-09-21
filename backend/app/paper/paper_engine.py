@@ -67,6 +67,66 @@ class PaperEngine:
         db.add_audit("user", "paper_reset", {"initial": initial, "purge_records": True})
         return self.summary()
 
+    def purge_dust(self, inst_id: str | None = None) -> list[dict]:
+        """清理"低于最小下单量、无法通过任何下单成交"的残仓（模拟盘专用）。
+
+        P0-7：绝不调用 place_intent —— 低于 minSz 的残值用真实下单是永远平不掉的
+        （会被 normalize_sz 以"数量低于最小下单量"拒绝），只能由模拟盘自身改账清理。
+
+        判定为 dust 的情形：
+          - 现货：余额小于该标的 minSz（含规格化后为 0）
+          - 合约：折算张数不足 1 张（int(sz/ctVal) < 1）
+        合约残仓同时把冻结保证金退回模拟账户（残值≈0），并写 audit_logs 供追溯。
+        返回被清理明细（空列表=无 dust）。
+        """
+        acct = self.account()
+        removed: list[dict] = []
+        coins = acct.get("coins") or {}
+        for coin in list(coins.keys()):
+            iid = f"{coin}-USDT"
+            if inst_id and iid != inst_id:
+                continue
+            sz = float(coins.get(coin) or 0)
+            _step, min_sz, _unit = self.data.spec_step(iid)
+            if sz <= 0 or (min_sz > 0 and sz < min_sz - 1e-12):
+                coins.pop(coin, None)
+                removed.append({"inst_id": iid, "kind": "spot", "sz": sz,
+                                "reason": f"低于最小下单量 {min_sz:g}，无法卖出"})
+        lev = acct.get("lev_positions") or []
+        keep: list[dict] = []
+        for lp in lev:
+            iid = lp.get("inst_id", "")
+            if inst_id and iid != inst_id:
+                keep.append(lp)
+                continue
+            sz = float(lp.get("sz") or 0)
+            ins = self.data.instrument(iid) or {}
+            if sz <= 0:
+                untradable, why = True, "持仓量为 0 的空壳"
+            elif ins.get("instType") == "SWAP":
+                # 折算张数 < 1 张 → 无法平仓（复用统一规格化口径，含浮点容差）
+                ct = float(ins.get("ctVal") or 0)
+                _out, err = self.data.normalize_sz(iid, sz * ct) if ct > 0 else (0.0, "规格缺失")
+                untradable, why = bool(err), "折算不足 1 张，无法平仓"
+            else:
+                _step, min_sz, _unit = self.data.spec_step(iid)
+                untradable = min_sz > 0 and sz < min_sz - 1e-12
+                why = f"低于最小下单量 {min_sz:g}，无法平仓"
+            if untradable:
+                margin = float(lp.get("margin") or 0)
+                acct["usdt"] = float(acct.get("usdt") or 0) + margin   # 退回冻结保证金
+                removed.append({"inst_id": iid, "kind": "lev", "side": lp.get("side"), "sz": sz,
+                                "margin_returned": round(margin, 8), "reason": why})
+            else:
+                keep.append(lp)
+        if removed:
+            acct["coins"] = coins
+            acct["lev_positions"] = keep
+            self._save(acct)
+            db.add_audit("system", "paper_purge_dust", {"removed": removed}, "ok")
+            log.warning("模拟盘清理 dust 残仓：%s", removed)
+        return removed
+
     def summary(self) -> dict:
         acct = self.account()
         pos_rows = []
