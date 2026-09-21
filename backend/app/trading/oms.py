@@ -414,7 +414,7 @@ class OMS:
             try:
                 await asyncio.sleep(60)
                 local_open = db.query(
-                    f"SELECT * FROM orders WHERE state IN ({','.join('?' * len(OPEN_STATES))})",
+                    f"SELECT * FROM orders WHERE venue='okx' AND state IN ({','.join('?' * len(OPEN_STATES))})",
                     tuple(OPEN_STATES),
                 )
                 if local_open:

@@ -142,6 +142,7 @@ TP1_R, TP1_PCT = 1.0, 0.25   # 1R 平 25%，止损推保本
 TP2_R, TP2_PCT = 2.0, 0.35   # 2R 平 35%，激活 ATR trailing
 TRAIL_ATR = 2.5              # trailing 距离 = 2.5×ATR（不低于保本价）
 TIME_STOP_BARS = 120         # 时间止损：120 根 bar 未到 TP1 且浮亏 → 离场
+MAX_CLOSE_RETRIES = 3        # P0-4：平仓最大重试次数，超出则触发 exchange 重同步
 
 
 class Autopilot:
@@ -166,10 +167,20 @@ class Autopilot:
         self._sleep_until: int = 0
         self._daily_realized_pnl: float = 0.0   # 当日已实现净盈亏（USDT）
         self._dd_pct: float = 0.0              # 缓存当前回撤供风控降档用
+        self._close_retries: dict[str, int] = {}  # P0-4：按 inst_id 累计平仓重试次数
 
     def bind_svc(self, svc) -> None:
         """注入 Services 容器：autopilot 据此读取系统级 venue 与实盘 oms/account。"""
         self.svc = svc
+
+    def _sync_delegated(self) -> None:
+        """P0-2：将当前被托管持仓的标的同步到行情中心，维持 ticker/candle 订阅。
+
+        持仓的止损/止盈/trailing 依赖实时行情事件；切换回标的后再切走时，
+        事件路由按 inst_id 分发——只要频道订阅了该标的，事件就能到达。
+        """
+        if self.data and hasattr(self.data, "set_delegated_insts"):
+            self.data.set_delegated_insts(set(self.positions.keys()))
 
     # ---------- 系统级模式（venue）派发 ----------
     @property
@@ -450,6 +461,7 @@ class Autopilot:
 
         # 发现已有持仓（venue 切换后收养，防重复开仓）
         self._discover_position(acct)
+        self._sync_delegated()                     # P0-2：收养持仓后同步行情订阅
 
         # 持仓中：持仓管理走 tick + signal-exit，不开新仓
         if self.position:
@@ -773,22 +785,44 @@ class Autopilot:
                 "inst_id": self.inst_id, "side": order_side, "ord_type": "market",
                 "sz_base": sz_base, "reduce_only": False, "source": "autopilot:open",
                 "leverage": leverage,
+                # P0-1：交易所侧止损——即使本地进程崩溃，该止损也在 OKX 侧生效
+                "sl_trigger_px": self.data.round_px(self.inst_id, plan["sl"]),
             })
-            fill_px = last_px
-            if row.get("cl_ord_id"):
-                tr = db.query("SELECT px FROM trades WHERE cl_ord_id=? ORDER BY id DESC LIMIT 1",
-                              (row["cl_ord_id"],))
-                if tr:
-                    fill_px = float(tr[0]["px"])
+            # P0-4：等待订单终态（最多 6s），按实际成交回填持仓，防止 IOC 不成交产生幽灵持仓
+            cl_ord_id = row.get("cl_ord_id")
+            filled_sz, fill_px = 0.0, last_px
+            if cl_ord_id:
+                for _attempt in range(30):       # 30×200ms = 6s 总超时
+                    await asyncio.sleep(0.2)
+                    o = db.query_one("SELECT state, filled_sz, avg_px FROM orders WHERE cl_ord_id=?",
+                                     (cl_ord_id,))
+                    if not o:
+                        continue
+                    state = o.get("state", "")
+                    if state in ("filled", "canceled", "partially_canceled", "failed",
+                                 "partially_filled"):
+                        filled_sz = float(o.get("filled_sz") or 0)
+                        fill_px = float(o.get("avg_px") or fill_px) or fill_px
+                        break
+                    if state == "live":
+                        continue   # 仍活跃，继续等
+                if filled_sz <= 1e-12:
+                    log.warning("autopilot 开仓单 %s 未成交（state=%s filled=%.6f），放弃开仓",
+                                cl_ord_id, o.get("state") if o else "unknown", filled_sz)
+                    self._notify("autopilot_unfilled", "warning",
+                                 f"开仓单 {cl_ord_id} 未成交（IOC保护价外），放弃开仓",
+                                 {"state": o.get("state") if o else "unknown", "cl_ord_id": cl_ord_id})
+                    return
             entry = fill_px
+            sz = filled_sz if filled_sz > 0 else float(row.get("sz") or sz_base)
             risk_dist = abs(entry - plan["sl"])
             if risk_dist <= 0:
                 return
             sign = -1 if is_short else 1
             self.position = {
                 "inst_id": self.inst_id,
-                "side": side, "sz": float(row.get("sz") or sz_base),
-                "orig_sz": float(row.get("sz") or sz_base),
+                "side": side, "sz": sz,
+                "orig_sz": sz,
                 "entry_px": entry, "sl_px": self.data.round_px(self.inst_id, plan["sl"]),
                 "risk_dist": risk_dist,
                 "tp1_px": self.data.round_px(self.inst_id, entry + sign * TP1_R * risk_dist),
@@ -820,6 +854,7 @@ class Autopilot:
                 self._daily_key = day
                 self._daily_opens = 0
             self._daily_opens += 1
+            self._sync_delegated()                 # P0-2：新增持仓 → 行情中心追订 ticker/candle
             venue_tag = "实盘" if self.venue == "okx" else "模拟"
             lev_tag = f" {leverage}x杠杆" if leverage > 1 else ""
             dir_tag = "开空" if is_short else "开多"
@@ -878,11 +913,21 @@ class Autopilot:
         is_short = pos.get("side") == "short"
         close_side = "buy" if is_short else "sell"
         try:
-            await self._executor().place_intent({
+            row = await self._executor().place_intent({
                 "inst_id": inst_id, "side": close_side, "ord_type": "market",
                 "sz_base": sell_sz, "reduce_only": True, "source": "autopilot:close",
                 "leverage": int(pos.get("leverage", 1) or 1),
             })
+            # P0-4：检查平仓单是否被成功接受；失败则重试，超出上限触权重同步
+            if not row or row.get("state") == "dead":
+                retry = self._close_retries.get(inst_id, 0) + 1
+                self._close_retries[inst_id] = retry
+                if retry > MAX_CLOSE_RETRIES:
+                    log.warning("autopilot 平仓 %s 连续 %d 次失败，触发 exchange 重同步", inst_id, retry)
+                    self._close_retries.pop(inst_id, None)
+                    await self._sync_from_exchange(inst_id)
+                return
+            self._close_retries.pop(inst_id, None)   # 成功后重置计数
             pos["sz"] -= sell_sz
             fully = pos["sz"] <= 1e-12
             if fully:
@@ -890,6 +935,7 @@ class Autopilot:
                 self._update_loss_streak(inst_id)
                 self._journal_close(inst_id, pos, reason)
                 self.positions.pop(inst_id, None)
+                self._sync_delegated()                 # P0-2：持仓清空 → 退订该标的行情频道
                 if inst_id == self.inst_id:
                     self.last_action = "flat"
             dir_tag = "平空" if is_short else "平多"
@@ -899,6 +945,44 @@ class Autopilot:
             log.info("autopilot %s sz=%.6f reason=%s fully=%s", dir_tag, sell_sz, reason, fully)
         except Exception as e:
             log.error("autopilot 平仓失败: %s", e)
+
+    async def _sync_from_exchange(self, inst_id: str) -> None:
+        """P0-4：从交易所账户同步指定标的的持仓状态，纠正本地幽灵持仓。
+
+        当平仓连续失败 MAX_CLOSE_RETRIES 次后调用此方法，以交易所真实状态
+        覆盖本地 positions（或清仓后重新 discover）。"""
+        log.warning("autopilot _sync_from_exchange: 开始同步 %s", inst_id)
+        try:
+            acct = await self._account_summary()
+        except Exception as e:
+            log.error("_sync_from_exchange 获取账户失败: %s", e)
+            return
+        # 查找交易所侧该标的的仓位
+        exchange_pos = None
+        for p in (acct.get("positions") or []):
+            if p.get("inst_id") == inst_id and float(p.get("pos") or 0) != 0:
+                exchange_pos = {
+                    "inst_id": inst_id,
+                    "side": p.get("pos_side", "long"),
+                    "sz": float(p.get("pos") or 0),
+                    "entry_px": float(p.get("avg_px") or 0),
+                }
+                break
+        local_pos = self.positions.get(inst_id)
+        if exchange_pos is None:
+            if local_pos:
+                log.warning("_sync_from_exchange: 交易所 %s 无仓位，清除本地", inst_id)
+                self.positions.pop(inst_id, None)
+                self._sync_delegated()
+            return
+        if local_pos:
+            local_pos["sz"] = exchange_pos["sz"]
+            local_pos["entry_px"] = exchange_pos.get("entry_px", local_pos["entry_px"])
+            log.info("_sync_from_exchange: %s 已对齐 sz=%.6f", inst_id, exchange_pos["sz"])
+        else:
+            log.warning("_sync_from_exchange: 交易所 %s 有仓位但本地无，收养", inst_id)
+            self._discover_position(acct)
+            self._sync_delegated()
 
     # ---------- 持仓管理（tick 级，优先级从高到低，全本地确定性） ----------
     async def _manage_position(self, inst_id: str, px: float) -> None:
@@ -1022,6 +1106,7 @@ class Autopilot:
         self._paper_peak_equity = 0.0
         self._peak_venue = None
         self.positions = {}
+        self._sync_delegated()                     # P0-2：重置后同步退订行情
 
     def on_venue_switch(self) -> None:
         """切换 venue 时调用：清仓位追踪 + 重置节流，各 venue 独立。
@@ -1030,6 +1115,7 @@ class Autopilot:
         注意：venue 切换会改变下单引擎（paper/OKX），旧 venue 持仓不在此托管，
         切回该 venue 时会再次发现收养。"""
         self.positions = {}
+        self._sync_delegated()                     # P0-2：清仓后同步退订行情
         self._last_close_ts = 0
         self._daily_key = ""
         self._daily_opens = 0
@@ -1041,6 +1127,7 @@ class Autopilot:
         try:
             acct = self._account_summary()
             self._discover_position(acct)
+            self._sync_delegated()                 # P0-2：收养持仓后同步行情订阅
             # 重置峰值到当前权益（防跳变误触回撤）
             equity = float(acct.get("equity", 0))
             self._paper_peak_equity = equity
@@ -1073,6 +1160,7 @@ class Autopilot:
         try:
             acct = self._account_summary()
             self._discover_position(acct)
+            self._sync_delegated()                 # P0-2：切换标的后同步行情订阅
         except Exception:
             log.debug("on_instrument_switch: 持仓发现延迟到 _decide_and_act")
         self._notify("autopilot_inst_switch", "info",

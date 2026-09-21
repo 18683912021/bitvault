@@ -17,6 +17,16 @@ PORT = int(os.environ.get("BV_PORT", "8000"))
 # 仅放行公开只读名单（status/market/brain/status|history/venue/instrument/health）。
 API_TOKEN = os.environ.get("BV_API_TOKEN", "")
 
+# CORS 允许的源（P1-7）：限制为本地开发/生产地址，禁止 all-origins。
+# 逗号分隔，如 "http://localhost:5173,http://127.0.0.1:8000"
+ALLOWED_ORIGINS = [
+    o.strip() for o in
+    os.environ.get("BV_CORS_ORIGINS",
+                   "http://localhost:5173,http://127.0.0.1:5173,"
+                   "http://localhost:8000,http://127.0.0.1:8000").split(",")
+    if o.strip()
+]
+
 # OKX 接入点：默认主站；大陆服务器连不上 www.okx.com 时，通过环境变量切换
 # 官方 AWS 接入点（https://aws.okx.com 与 wss://wsaws.okx.com:8443 系列），无需改代码。
 OKX_REST_BASE = os.environ.get("BV_OKX_REST_BASE", "https://www.okx.com")

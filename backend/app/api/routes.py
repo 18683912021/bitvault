@@ -131,10 +131,20 @@ async def get_venue(request: Request):
 @router.post("/venue")
 async def set_venue(request: Request, body: dict):
     """切换系统级模式：paper 模拟虚拟资金 / okx 实盘真实资金。
-    各 venue 配置独立（模式/杠杆/开关），切换时清仓位追踪 + 重置节流。"""
+    各 venue 配置独立（模式/杠杆/开关），切换时清仓位追踪 + 重置节流。
+
+    P0-3：从 okx 切换到 paper 前检查实盘仓位；有仓位时需 force=true 二次确认。"""
     want = (body or {}).get("venue", "paper")
     s = svc(request)
-    actual = s.set_venue(want)
+    force = bool((body or {}).get("force", False))
+    if want == "paper" and s.venue == "okx" and s.has_real_positions() and not force:
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False, "venue": s.venue,
+                     "detail": "OKX 实盘仍有未平仓位，切换到模拟盘将导致持仓脱管（本地止损失效）。"
+                               "如需强制切换，请传 force=true。",
+                     "has_positions": True})
+    actual = s.set_venue(want, force=force)
     # 切换后：autopilot 读取新 venue 的独立配置，清旧仓位追踪
     if s.brain:
         s.brain.on_venue_switch()

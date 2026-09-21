@@ -5,7 +5,7 @@
   高风险路径还必须带 confirm=true（防误操作/CSRF 式直接调用）。
 - 公开只读名单：GET /api/status、/api/market/*（GET）、/api/brain/status、
   /api/brain/history、GET /api/venue、GET /api/instrument、/api/health。
-"""
+  P1-7：/api/notifications 已从公开名单移除，需 Token 访问。"""
 from __future__ import annotations
 
 import hmac
@@ -26,7 +26,6 @@ PUBLIC_GET_PREFIXES = (
     "/api/brain/history",
     "/api/venue",
     "/api/instrument",
-    "/api/notifications",      # 通知：运营/交易事件（不含密钥），可公开只读
 )
 
 # 高风险写操作 → 必须 confirm=true（请求体 JSON 中）

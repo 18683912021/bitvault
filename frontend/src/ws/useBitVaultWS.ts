@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import type { WsMessage, WsSnapshot } from '../api/types';
+import { getApiToken } from '../api/client';
 import { useAppStore } from '../store/useAppStore';
 import { useMarketStore } from '../store/useMarketStore';
 import { useAccountStore } from '../store/useAccountStore';
@@ -14,7 +15,10 @@ export function useBitVaultWS() {
   useEffect(() => {
     const connect = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(`${proto}://${location.host}/ws`);
+      // P1-2：WebSocket 连接携带 token（与 HTTP Bearer 同源）
+      const token = getApiToken();
+      const tokenParam = token ? `?token=${encodeURIComponent(token)}` : '';
+      const ws = new WebSocket(`${proto}://${location.host}/ws${tokenParam}`);
       wsRef.current = ws;
 
       ws.onopen = () => {

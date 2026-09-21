@@ -63,12 +63,34 @@ class Services:
     def has_key(self) -> bool:
         return self.private_client is not None
 
-    def set_venue(self, venue: str) -> str:
-        """切换系统级模式。okx 模式若未连 Key，自动落回 paper（安全兜底，不报错）。"""
+    def has_real_positions(self) -> bool:
+        """P0-3：检查 OKX 实盘账户是否持有非零仓位。
+
+        用于切换 venue 前的安全检查（切到 paper 时实盘仓位会脱管）。
+        """
+        if not self.account:
+            return False
+        try:
+            for p in (self.account.positions or []):
+                if float(p.get("pos") or 0) != 0:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def set_venue(self, venue: str, force: bool = False) -> str:
+        """切换系统级模式。okx 模式若未连 Key，自动落回 paper（安全兜底，不报错）。
+
+        P0-3：从 okx 切换到 paper 时，若 OKX 实盘仍有非零仓位，默认拒绝切换
+        （防止实盘持仓脱管）。force=True 可强制切换（如 API Key 被断开时）。"""
         if venue not in ("paper", "okx"):
             venue = "paper"
         if venue == "okx" and not self.has_key():
             venue = "paper"   # 未连 Key 不能进实盘，静默落回模拟
+        # P0-3：实盘有持仓 → 切 paper 必须显式 force（API 层会先调 check 拒绝）
+        if venue == "paper" and self.venue == "okx" and self.has_real_positions() and not force:
+            log.warning("拒绝切换 venue okx→paper：OKX 实盘仍有非零持仓，脱管风险")
+            return self.venue   # 保持当前 venue 不变
         self.venue = venue
         db.set_setting("system_venue", venue)
         log.info("系统级模式切换 → %s", venue)
@@ -329,7 +351,10 @@ if not config.API_TOKEN:
     log.warning("未配置 BV_API_TOKEN：交易/敏感 API 全部禁用（fail-closed），仅公开只读接口可用。"
                 "生产部署请设置环境变量。")
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=config.ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 app.include_router(routes.router)
 app.include_router(ws_routes.router)

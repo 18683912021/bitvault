@@ -45,6 +45,9 @@ class DataService:
         self._refresh_task: asyncio.Task | None = None   # 支持集定时重试同步任务
         # 当前驾驶标的（动态可切换）：公共/K线频道只订阅它，切换时重订阅并预热 K 线
         self.active_inst: str = config.DEFAULT_INST_ID
+        # P0-2：被托管持仓标的集合——即使切换驾驶标的，也要维持这些标的的 ticker/candle 订阅，
+        # 使 autopilot 的止损/止盈/trailing 继续生效（成本极低，仅追加 ticker 与 K 线频道）。
+        self._delegated_insts: set[str] = set()
 
     # ---------- Instruments ----------
     async def load_instruments(self, refresh: bool = True) -> None:
@@ -168,6 +171,24 @@ class DataService:
     def is_supported(self, inst_id: str) -> bool:
         """标的是否在支持集内（OKX 已同步；未同步时回退到注册表兜底集合）。"""
         return inst_id in self.instruments or config.InstrumentRegistry.contains(inst_id)
+
+    # P0-2：被托管持仓标的——即使切换驾驶标的也维持 ticker/candle 订阅
+    def set_delegated_insts(self, insts: set[str]) -> None:
+        """更新被托管持仓标的集合，并触发频道重订阅（ticker + candle）。
+
+        autopilot 在持仓变化时调用，确保旧标的的止损/止盈/trailing 不受切换标的的影响。
+        成本极低：OKX 允许多标的并行订阅，每条 ticker 推送约百字节级别。
+        """
+        new = {i for i in insts if i != self.active_inst and self.is_supported(i)}
+        if new == self._delegated_insts:
+            return
+        self._delegated_insts = new
+        if self.public_ws_ref:
+            asyncio.ensure_future(self.public_ws_ref.resubscribe(self.subscribe_public_channels()))
+        if self.business_ws_ref:
+            asyncio.ensure_future(self.business_ws_ref.resubscribe(self.subscribe_business_channels()))
+        log.info("托管标的频道已更新：delegated=%s active=%s",
+                 sorted(self._delegated_insts), self.active_inst)
 
     # ---------- 当前驾驶标的（切换） ----------
     async def set_active_inst(self, inst_id: str) -> None:
@@ -300,18 +321,31 @@ class DataService:
             # 未收盘 bar 无消费者（P2-3：原 _buffer 从未被读取，已删除）
 
     def subscribe_public_channels(self) -> list[dict]:
-        """公共端点频道（仅当前驾驶标的）：tickers / books5 / trades。"""
-        return [
+        """公共端点频道：当前驾驶标的的 tickers/books5/trades + 所有被托管持仓标的的 tickers。
+
+        P0-2：被托管标的至少需要 tickers 维持止损/止盈管理（价格变化驱动 tick 循环）；
+        books5/trades 仅驾驶标的需要（盘口与成交明细），托管标的不追加以节省带宽。
+        """
+        channels = [
             {"channel": ch, "instId": self.active_inst}
             for ch in ("tickers", "books5", "trades")
         ]
+        for inst in sorted(self._delegated_insts):
+            if inst != self.active_inst:
+                channels.append({"channel": "tickers", "instId": inst})
+        return channels
 
     def subscribe_business_channels(self) -> list[dict]:
-        """business 端点频道（仅当前驾驶标的）：candle* K 线。"""
-        return [
-            {"channel": f"candle{period}", "instId": self.active_inst}
-            for period in ("1m", "5m", "15m", "1H", "4H", "1D")
-        ]
+        """business 端点频道：当前驾驶标的 + 被托管持仓标的的 K 线。
+
+        P0-2：托管标的需要 K 线流驱动 signal-exit 与时间止损，与驾驶标的同频订阅。
+        """
+        all_insts = {self.active_inst} | self._delegated_insts
+        channels = []
+        for inst in sorted(all_insts):
+            for period in ("1m", "5m", "15m", "1H", "4H", "1D"):
+                channels.append({"channel": f"candle{period}", "instId": inst})
+        return channels
 
     # 兼容旧入口（保留方法名，返回公共频道，避免历史调用方破坏）
     def subscribe_channels(self) -> list[dict]:
